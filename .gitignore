@@ -1,0 +1,5 @@
+bin/
+*.suo
+*.user
+Thumbs.db
+Desktop.ini
