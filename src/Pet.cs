@@ -208,34 +208,68 @@ namespace ClaudePet
         public const int Working = 1;
         public const int Waiting = 2;
         public const int Celebrating = 3;
+        public const int StoppedIncomplete = 4; // Stop が来たが Todo が未完 (「途中で止まったよ」)
 
         public string Project;
         public int State;
         public long LastSeq;        // 単調増加のイベント順序
         public DateTime LastAtUtc;  // 古いエントリ掃除用
 
-        // 推定進捗 (Claude 自身が認識している Task 群に基づく)。
+        // 「依頼 (Request)」= そのセッションで最後に UserPromptSubmit が来てから
+        // Stop までの1ターン。新しい依頼が始まったら進捗はリセットする。
+        public long RequestGen;
+
+        // 依頼全体の推定進捗 (Claude 自身が認識している Task 群に基づく)。
         // TodoWrite スナップショット (SnapTotal>=0) を優先し、無ければ
         // TaskCreated/TaskCompleted の一意 task_id 集合から計算する。
         public HashSet<string> CreatedIds;    // 遅延生成。上限 MaxTaskIds
         public HashSet<string> CompletedIds;
         public int SnapTotal = -1;            // -1 = スナップショット無し
         public int SnapDone;
+        public int SnapInProg;
 
         public const int MaxTaskIds = 256;
 
-        // 表示用進捗。total<=0 なら進捗表示なし
-        public void GetProgress(out int done, out int total)
+        public void ResetRequest()
         {
-            if (SnapTotal > 0) { done = SnapDone; total = SnapTotal; return; }
+            RequestGen++;
+            SnapTotal = -1;
+            SnapDone = 0;
+            SnapInProg = 0;
+            if (CreatedIds != null) { CreatedIds.Clear(); CompletedIds.Clear(); }
+        }
+
+        // 依頼全体の推定進捗。total<=0 なら進捗表示なし。
+        // in_progress は 0.5 個分の完了として加点する (作業着手を反映しつつ盛りすぎない)
+        public void GetProgress(out int done, out int inProg, out int total)
+        {
+            if (SnapTotal > 0) { done = SnapDone; inProg = SnapInProg; total = SnapTotal; return; }
             if (SnapTotal < 0 && CreatedIds != null && CreatedIds.Count > 0)
             {
                 done = 0;
                 foreach (string id in CompletedIds) { if (CreatedIds.Contains(id)) done++; }
+                inProg = 0;
                 total = CreatedIds.Count;
                 return;
             }
-            done = 0; total = 0;
+            done = 0; inProg = 0; total = 0;
+        }
+
+        public int ProgressPercent()
+        {
+            int done, inProg, total;
+            GetProgress(out done, out inProg, out total);
+            if (total <= 0) return -1;
+            int pct = (int)Math.Floor((done + 0.5 * inProg) * 100.0 / total);
+            return pct > 100 ? 100 : pct;
+        }
+
+        // 完了ゲート: Todo を使った依頼で未完項目が残っているか
+        public bool HasUnfinishedTasks()
+        {
+            int done, inProg, total;
+            GetProgress(out done, out inProg, out total);
+            return total > 0 && done < total;
         }
     }
 
@@ -252,6 +286,9 @@ namespace ClaudePet
 
         private const int MaxSessions = 8;             // 通常同時利用は数セッション。無制限に増やさない
         private static readonly TimeSpan StaleAfter = TimeSpan.FromHours(4);
+        // 「途中で止まったよ」はユーザーが気付くまで残すが、終了済みセッションが
+        // 他のアクティブセッションの表示を塞ぎ続けないよう 10 分で自動的に消す
+        private static readonly TimeSpan IncompleteNoticeTtl = TimeSpan.FromMinutes(10);
 
         private const int AnimNone = 0;
         private const int AnimCelebrate = 1;  // 3回大きくバウンド
@@ -432,14 +469,17 @@ namespace ClaudePet
                     _recentlyEnded.Remove(sessionId); // 正当な再開
                     s = Upsert(sessionId, s, project, true);
                     s.State = Session.Working;
+                    s.ResetRequest(); // 新しい依頼: 前回依頼の進捗を破棄
                     break;
 
                 case PetEvent.Activity:
                 case PetEvent.TaskCreated:
                 case PetEvent.TaskCompleted:
                 case PetEvent.TaskSnapshot:
-                    // Celebrating 中の残イベントでは状態を戻さない
-                    if (s != null && s.State == Session.Celebrating) { Touch(s, project); break; }
+                    // Celebrating / StoppedIncomplete 中の残イベントでは状態を戻さない
+                    // (「途中で止まったよ」は次の UserPromptSubmit まで維持する)
+                    if (s != null && (s.State == Session.Celebrating || s.State == Session.StoppedIncomplete))
+                    { Touch(s, project); break; }
                     // 終了直後のセッションの遅延イベントは幽霊再作成になるので無視
                     if (s == null && IsTombstoned(sessionId)) return;
                     // PostToolUse 系の cwd はツール実行ディレクトリで揺れることがあるため
@@ -458,9 +498,22 @@ namespace ClaudePet
                     break;
 
                 case PetEvent.TaskComplete:
+                    // debounce: 同一依頼の重複 Stop / 遅延 Stop で二重 celebration しない
+                    if (s != null && s.State == Session.Celebrating) { Touch(s, project); break; }
+                    if (s == null && IsTombstoned(sessionId)) return;
                     s = Upsert(sessionId, s, project, true);
-                    s.State = Session.Celebrating;
-                    becameCelebrating = true;
+                    if (s.HasUnfinishedTasks())
+                    {
+                        // Todo を使った依頼で未完項目が残ったまま停止 → 完了とは言わない
+                        bool wasIncomplete = (s.State == Session.StoppedIncomplete);
+                        s.State = Session.StoppedIncomplete;
+                        becameWaiting = !wasIncomplete; // Waiting と同じ控えめ通知 (音+軽バウンド)
+                    }
+                    else
+                    {
+                        s.State = Session.Celebrating;
+                        becameCelebrating = true;
+                    }
                     break;
 
                 case PetEvent.SessionEnd:
@@ -545,15 +598,17 @@ namespace ClaudePet
                     break;
 
                 case PetEvent.TaskSnapshot:
-                    // extra = "done/total"。TodoWrite の全量スナップショットなので冪等。
-                    int slash = extra.IndexOf('/');
-                    if (slash <= 0) return;
-                    int done, total;
-                    if (!int.TryParse(extra.Substring(0, slash), out done)) return;
-                    if (!int.TryParse(extra.Substring(slash + 1), out total)) return;
-                    if (total < 0 || done < 0 || done > total) return;
+                    // extra = "completed/in_progress/total"。TodoWrite の全量スナップショットなので冪等。
+                    string[] nums = extra.Split('/');
+                    if (nums.Length != 3) return;
+                    int done, inProg, total;
+                    if (!int.TryParse(nums[0], out done)) return;
+                    if (!int.TryParse(nums[1], out inProg)) return;
+                    if (!int.TryParse(nums[2], out total)) return;
+                    if (total < 0 || done < 0 || inProg < 0 || done + inProg > total) return;
                     s.SnapTotal = total; // total=0 は「リストが空になった」= 進捗表示なし
                     s.SnapDone = done;
+                    s.SnapInProg = inProg;
                     break;
             }
         }
@@ -585,13 +640,23 @@ namespace ClaudePet
             DateTime now = DateTime.UtcNow;
             foreach (var kv in _sessions)
             {
-                if (now - kv.Value.LastAtUtc > StaleAfter)
+                TimeSpan age = now - kv.Value.LastAtUtc;
+                bool stale = age > StaleAfter ||
+                    (kv.Value.State == Session.StoppedIncomplete && age > IncompleteNoticeTtl);
+                if (stale)
                 {
                     if (remove == null) remove = new List<string>();
                     remove.Add(kv.Key);
                 }
             }
-            if (remove != null) foreach (string k in remove) _sessions.Remove(k);
+            if (remove != null)
+            {
+                foreach (string k in remove)
+                {
+                    _sessions.Remove(k);
+                    AddTombstone(k);
+                }
+            }
 
             while (_sessions.Count > MaxSessions)
             {
@@ -630,6 +695,7 @@ namespace ClaudePet
             switch (state)
             {
                 case Session.Waiting: return 3;
+                case Session.StoppedIncomplete: return 3; // Waiting と同格 (要ユーザー確認)。同格は最新優先
                 case Session.Celebrating: return 2;
                 case Session.Working: return 1;
                 default: return 0;
@@ -642,18 +708,18 @@ namespace ClaudePet
         {
             string id = ComputeDisplaySession();
             Session s = (id != null) ? _sessions[id] : null;
-            int done = 0, total = 0;
-            if (s != null) s.GetProgress(out done, out total);
+            int pct = (s != null) ? s.ProgressPercent() : -1;
             string key = (s == null) ? "idle"
-                : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + done + "/" + total;
+                : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + pct;
             if (!force && key == _shownKey) return; // 同一表示なら再描画しない (PostToolUse連発対策)
             _shownKey = key;
 
             Bitmap bmp;
             if (s == null) bmp = PetRenderer.RenderIdle(_winW, _winH, _scale);
             else if (s.State == Session.Waiting) bmp = PetRenderer.RenderWaiting(_winW, _winH, _scale, s.Project);
+            else if (s.State == Session.StoppedIncomplete) bmp = PetRenderer.RenderStopped(_winW, _winH, _scale, s.Project);
             else if (s.State == Session.Celebrating) bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project);
-            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, done, total);
+            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct);
 
             using (bmp) { ApplyBitmap(bmp, _baseX, _baseY); }
 
@@ -786,15 +852,16 @@ namespace ClaudePet
         }
 
         // Working: 吹き出しなしの控えめなピル + 「作業中…」。
-        // total>0 のときだけ推定進捗 (bar + 推定N% + done/total) を追加表示する。
-        public static Bitmap RenderWorking(int w, int h, float scale, string project, int done, int total)
+        // pct>=0 のときだけ依頼全体の推定進捗 (bar + 全体 推定N%) を追加表示する。
+        // Task 件数 (3/5 等) は表示しない。
+        public static Bitmap RenderWorking(int w, int h, float scale, string project, int pct)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                if (total > 0)
-                    DrawWorkingProgressPill(g, w, scale, project, done, total);
+                if (pct >= 0)
+                    DrawWorkingProgressPill(g, w, scale, project, pct);
                 else
                     DrawPill(g, w, scale, "作業中…", project,
                         Color.FromArgb(205, 250, 250, 248),   // 背景: 静かな白
@@ -805,8 +872,24 @@ namespace ClaudePet
             return bmp;
         }
 
-        // Task がある Working 用: 作業中… / progress bar / 推定 N% / done / total / project
-        private static void DrawWorkingProgressPill(Graphics g, int w, float scale, string project, int done, int total)
+        // Stop したが Todo 未完: 完了とは言わない控えめな注意表示
+        public static Bitmap RenderStopped(int w, int h, float scale, string project)
+        {
+            Bitmap bmp = NewCanvas(w, h);
+            using (Graphics g = NewGraphics(bmp))
+            {
+                DrawChick(g, w, h, scale);
+                DrawPill(g, w, scale, "途中で止まったよ", project,
+                    Color.FromArgb(242, 245, 236, 226),   // 背景: 淡いベージュ
+                    Color.FromArgb(255, 196, 156, 108),   // 枠: 茶系
+                    Color.FromArgb(255, 140, 96, 48),     // 文字: 濃い茶
+                    true, 16f);
+            }
+            return bmp;
+        }
+
+        // Task がある Working 用: 作業中… / progress bar / 全体 推定 N% / project
+        private static void DrawWorkingProgressPill(Graphics g, int w, float scale, string project, int pct)
         {
             Color bg = Color.FromArgb(205, 250, 250, 248);
             Color border = Color.FromArgb(255, 210, 205, 196);
@@ -819,7 +902,7 @@ namespace ClaudePet
             float bx = 24 * scale;
             float by = 10 * scale;
             float bw = w - 48 * scale;
-            float bh = (hasProject ? 112 : 94) * scale;
+            float bh = (hasProject ? 96 : 78) * scale;
 
             using (GraphicsPath path = RoundedRect(bx, by, bw, bh, 12 * scale))
             {
@@ -843,7 +926,7 @@ namespace ClaudePet
                 using (GraphicsPath track = RoundedRect(barX, barY, barW, barH, barH / 2f))
                 using (var trackBrush = new SolidBrush(trackColor))
                     g.FillPath(trackBrush, track);
-                float ratio = (float)done / total;
+                float ratio = pct / 100f;
                 if (ratio > 1f) ratio = 1f;
                 float fillW = barW * ratio;
                 if (fillW >= barH) // 極端に短いと角丸が破綻するため最小幅まで描かない
@@ -853,20 +936,15 @@ namespace ClaudePet
                         g.FillPath(fillBrush, fill);
                 }
 
-                int pct = (int)Math.Floor(done * 100.0 / total);
-                using (var font = new Font("Yu Gothic UI", 13f * scale, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var font = new Font("Yu Gothic UI", 13.5f * scale, FontStyle.Bold, GraphicsUnit.Pixel))
                 using (var brush = new SolidBrush(textColor))
-                    g.DrawString("推定 " + pct + "%", font, brush, w / 2f, by + 47 * scale, fmt);
-
-                using (var font = new Font("Yu Gothic UI", 12f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (var brush = new SolidBrush(subColor))
-                    g.DrawString(done + " / " + total, font, brush, w / 2f, by + 66 * scale, fmt);
+                    g.DrawString("全体 推定 " + pct + "%", font, brush, w / 2f, by + 48 * scale, fmt);
 
                 if (hasProject)
                 {
                     using (var font = new Font("Yu Gothic UI", 12.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                     using (var brush = new SolidBrush(subColor))
-                        g.DrawString(project, font, brush, w / 2f, by + 86 * scale, fmt);
+                        g.DrawString(project, font, brush, w / 2f, by + 70 * scale, fmt);
                 }
             }
         }

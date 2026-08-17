@@ -63,6 +63,111 @@ namespace ClaudePetNotify
         [DllImport("user32.dll")]
         private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PROCESSENTRY32W
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool Process32FirstW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool Process32NextW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool GetProcessTimes(IntPtr hProcess, out long creation, out long exit, out long kernel, out long user);
+
+        // 祖先チェーンに claude 本体が2つ以上あれば nested。
+        // 1つ目 = この hook を発火させた claude 自身、2つ目以降 = それを tool 内から
+        // 起動した別の Claude セッション。PID 再利用による誤判定は
+        // 「親の起動時刻 <= 子の起動時刻」検証で排除する。
+        private static bool IsNestedClaude()
+        {
+            try
+            {
+                var parentOf = new System.Collections.Generic.Dictionary<uint, uint>();
+                var nameOf = new System.Collections.Generic.Dictionary<uint, string>();
+
+                IntPtr snap = CreateToolhelp32Snapshot(0x2 /*TH32CS_SNAPPROCESS*/, 0);
+                if (snap == new IntPtr(-1)) return false;
+                try
+                {
+                    var pe = new PROCESSENTRY32W();
+                    pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32W));
+                    if (Process32FirstW(snap, ref pe))
+                    {
+                        do
+                        {
+                            parentOf[pe.th32ProcessID] = pe.th32ParentProcessID;
+                            nameOf[pe.th32ProcessID] = pe.szExeFile ?? "";
+                        } while (Process32NextW(snap, ref pe));
+                    }
+                }
+                finally { CloseHandle(snap); }
+
+                int claudeCount = 0;
+                uint pid = (uint)Process.GetCurrentProcess().Id;
+                long childStart = StartTimeOf(pid);
+                var visited = new System.Collections.Generic.HashSet<uint>();
+
+                for (int hop = 0; hop < 32; hop++)
+                {
+                    uint ppid;
+                    if (!parentOf.TryGetValue(pid, out ppid) || ppid == 0 || !visited.Add(pid)) break;
+                    string pname;
+                    if (!nameOf.TryGetValue(ppid, out pname)) break;
+
+                    // PID 再利用検出: 「親」の起動が子より後なら本物の祖先ではない
+                    long parentStart = StartTimeOf(ppid);
+                    if (parentStart == 0 || (childStart != 0 && parentStart > childStart)) break;
+
+                    string n = pname.ToLowerInvariant();
+                    if (n == "claude.exe" || n == "claude")
+                    {
+                        claudeCount++;
+                        if (claudeCount >= 2) return true;
+                    }
+                    pid = ppid;
+                    childStart = parentStart;
+                }
+                return false;
+            }
+            catch { return false; } // 判定不能時は抑制しない (通知を失うより誤通知の方がまし、ではなく安全側=通常動作)
+        }
+
+        private static long StartTimeOf(uint pid)
+        {
+            IntPtr h = OpenProcess(0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/, false, pid);
+            if (h == IntPtr.Zero) return 0;
+            try
+            {
+                long c, e, k, u;
+                if (GetProcessTimes(h, out c, out e, out k, out u)) return c;
+                return 0;
+            }
+            finally { CloseHandle(h); }
+        }
+
         private static int Main(string[] args)
         {
             try
@@ -99,6 +204,18 @@ namespace ClaudePetNotify
                     string agentId = ExtractString(json, "agent_id");
                     sessionId = ExtractString(json, "session_id");
                     project = ToProjectName(ExtractString(json, "cwd"));
+
+                    // Nested child Claude 判定 (プロセス祖先チェーン方式):
+                    // この helper の親プロセスは hook を発火させた claude 本体。その祖先に
+                    // さらに別の claude が居れば、「別の Claude セッションの tool 内から起動
+                    // された子 Claude」と確実に判断できるので、UI へは一切流さない。
+                    // 手動起動の独立セッション (VS Code / terminal 直下) は祖先に claude が
+                    // 居ないので抑制されない。環境変数は親子で同一値になるため使えない (実測)。
+                    if (IsNestedClaude())
+                    {
+                        DebugLog(0, sessionId, project, "suppressed:nested ev=" + eventName);
+                        return 0;
+                    }
 
                     switch (eventName)
                     {
@@ -160,10 +277,29 @@ namespace ClaudePetNotify
                 }
 
                 bool ok = SendEvent(hwnd, eventType, sessionId + "\n" + project + "\n" + extra);
-                DebugLog(eventType, sessionId, project + " extra=" + extra, ok ? "sent" : "SEND-FAIL err=" + Marshal.GetLastWin32Error());
+                DebugLog(eventType, sessionId, project + " extra=" + extra + " " + EnvSummary(),
+                    ok ? "sent" : "SEND-FAIL err=" + Marshal.GetLastWin32Error());
             }
             catch { }
             return 0;
+        }
+
+        private static string Short(string s)
+        {
+            return s.Length > 8 ? s.Substring(0, 8) : s;
+        }
+
+        private static string EnvSummary()
+        {
+            string[] names = { "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT" };
+            var sb = new StringBuilder();
+            foreach (string n in names)
+            {
+                string v = Environment.GetEnvironmentVariable(n);
+                sb.Append(n.Replace("CLAUDE_CODE_", "").Replace("CLAUDE", "C")).Append('=')
+                  .Append(v == null ? "-" : Short(v)).Append(' ');
+            }
+            return sb.ToString();
         }
 
         // bin\debug.flag が存在するときだけ bin\debug.log へイベントを追記する (通常は完全に無効)
@@ -244,9 +380,10 @@ namespace ClaudePetNotify
             return sb.ToString();
         }
 
-        // PostToolUse(TodoWrite) の tool_input 内の "status" 値だけを数えて "done/total" を返す。
-        // todo 本文は読まない・送らない。tool_response 以降は数えない (echo による二重カウント防止)。
-        // TodoWrite が空リスト (全消去) のときは "0/0" を返し、Pet 側で進捗表示を消す。
+        // PostToolUse(TodoWrite) の tool_input 内の "status" 値だけを数えて
+        // "completed/in_progress/total" を返す。todo 本文は読まない・送らない。
+        // tool_response 以降は数えない (echo による二重カウント防止)。
+        // TodoWrite が空リスト (全消去) のときは "0/0/0" を返し、Pet 側で進捗表示を消す。
         private static string CountTodoStatuses(string json)
         {
             int start = json.IndexOf("\"tool_input\"", StringComparison.Ordinal);
@@ -254,13 +391,14 @@ namespace ClaudePetNotify
             int end = json.IndexOf("\"tool_response\"", start, StringComparison.Ordinal);
             string region = (end > start) ? json.Substring(start, end - start) : json.Substring(start);
 
-            int total = 0, done = 0;
+            int total = 0, done = 0, inProg = 0;
             foreach (Match m in Regex.Matches(region, "\"status\"\\s*:\\s*\"(pending|in_progress|completed)\""))
             {
                 total++;
                 if (m.Groups[1].Value == "completed") done++;
+                else if (m.Groups[1].Value == "in_progress") inProg++;
             }
-            return done + "/" + total;
+            return done + "/" + inProg + "/" + total;
         }
 
         private static string ToProjectName(string cwd)

@@ -7,25 +7,26 @@ Claude Code の状態を、デスクトップ右下の小さなひよこを見�
 |---|---|---|
 | Idle | 🐣 + `Claude` | 何もしていない。完全静止 |
 | Working | 🐣 + 「作業中…」+ project名 | 放置してよい (グレーのピル・静止) |
-| Working (Taskあり) | 🐣 + 「作業中…」+ progress bar + 「推定 N%」+ 「done / total」+ project名 | Claude がタスクリストを使って作業中。おおまかな進み具合が分かる |
+| Working (Taskあり) | 🐣 + 「作業中…」+ progress bar + 「**全体 推定 N%**」+ project名 | 今投げた依頼全体のおおよその進み具合。Task 件数 (3/5 等) は表示しない |
 | Waiting | 🐣 + 「確認して！」+ project名 | **permission承認待ち。見に行く必要あり** (オレンジ吹き出し・軽く2回ピョコ・警告音1回) |
-| Completed | 🐣 + 「終わったよ！」+ project名 | 完了 (白吹き出し・3回ピョコピョコ・通知音1回・約5秒後に次の表示へ) |
+| StoppedIncomplete | 🐣 + 「途中で止まったよ」+ project名 | **Stop したが Task が未完のまま**。完了とは扱わない (ベージュ吹き出し・警告音1回・最大10分表示) |
+| Completed | 🐣 + 「終わったよ！」+ project名 | **依頼全体が本当に完了** (白吹き出し・3回ピョコピョコ・通知音1回・約5秒後に次の表示へ) |
 
 - 背景完全透過・枠なし・タスクバー/Alt+Tab 非表示・常に最前面
 - **クリック透過**: キャラの背後にある VS Code や Chrome をそのまま操作できる
 - 完全 event-driven。polling なし。アイドル時は `GetMessage` でブロック: **CPU 0% / GPU 0**
 - Electron / WebView / Node 常駐 / localhost サーバー / DB 一切なし
 
-## 実測値 (Windows 11, 2026-08-17, Phase 4 時点)
+## 実測値 (Windows 11, 2026-08-17, Phase 4.1 時点)
 
 | 項目 | 実測 |
 |---|---|
-| 待機時 Private Working Set | 約 13.5 MB (起動直後) 〜 17.0 MB (多数の進捗描画後の定常値・増加停止確認済み) |
+| 待機時 Private Working Set | 約 13.5 MB (起動直後) 〜 17 MB (多数の進捗描画後の定常値・増加停止確認済み) |
 | 待機時 CPU (60秒計測) | ほぼ 0 ms (イベント無し時は完全 0%) |
 | 待機時 GPU | **0** (GPUエンジンインスタンス自体が0個) |
-| Working / Waiting 表示中 | Idle と同じ (静止ビットマップ、タイマーなし)。Task イベント到着時だけ瞬間再描画 |
+| Working / Waiting 表示中 | Idle と同じ (静止ビットマップ、タイマーなし)。イベント到着時だけ瞬間再描画 |
 | アニメーション1回の CPU 累計 | 約 15〜50 ms |
-| Hook helper 1回 | 平均約 63 ms で起動〜終了 (async のため Claude を待たせない)。残留プロセスなし |
+| Hook helper 1回 | 約 60〜70 ms で起動〜終了 (祖先チェーン検査 +数ms 込み、async のため Claude を待たせない)。残留プロセスなし |
 | GDI / USER / ハンドル | 5 / 7 / 213 で大量イベント後も完全に一定 (リークなし) |
 
 ## アーキテクチャ
@@ -66,29 +67,56 @@ Celebrating
 SessionEnd → エントリ削除 (Celebrating中は celebration 終了まで維持)
 ```
 
-### 推定進捗 (Phase 4)
+### 依頼全体の推定進捗 (Phase 4 / 4.1)
 
-Claude Code がタスクリストを使って作業しているときだけ、Working ピルに
-progress bar と「推定 N%」「done / total」を表示する。
+「依頼 (Request)」= そのセッションで最後に `UserPromptSubmit` が来てから Stop までの1ターン。
+新しい依頼が始まると前回依頼の進捗はリセットされる。
 
-- **「推定」であって精密な実進捗ではない**。「現在 Claude 自身が認識している Task 群」に対する完了割合
+Claude がタスクリストを使って作業しているときだけ、Working ピルに
+progress bar と「**全体 推定 N%**」を表示する。Task 件数 (3/5 等) は UI に出さない。
+
+- **「推定」であって精密な実進捗ではない**。「現在 Claude 自身が認識している Task 群」に対する進行割合
 - **ETA ではない**。残り時間の予測は一切しない
-- 計算式: `完了タスク数 ÷ 総タスク数 × 100` (小数切り捨て)
-- **Claude が途中でタスクを追加すると推定進捗が下がる場合がある** (総仕事量の認識が増えたため。バグではない)
+- 計算式: `(completed + 0.5 × in_progress) ÷ total × 100` (小数切り捨て)。
+  in_progress は「着手済み」として半分だけ加点する (盛りすぎない範囲で作業中項目を反映)
+- **Claude が途中でタスクを追加すると全体推定が下がる場合がある** (総仕事量の認識が増えたため。バグではない)
 - 100% になっても Stop が来るまでは「作業中…」のまま。Task 完了率と turn 完了は別物
-- **タスクリストを使わない作業では進捗は表示されない**。経過時間やツール実行回数から進捗を捏造することはしない
+- **タスクリストを使わない依頼では進捗は表示されない**。経過時間やツール実行回数から進捗を捏造することはしない
 
 進捗のデータ源は2系統 (v2.1.233 での実測に基づく):
 
-1. **TodoWrite スナップショット (主経路)**: 通常セッションのタスク管理は TodoWrite ツールで行われる。
-   既存の PostToolUse hook payload の `tool_input` 内の `"status"` 値の件数だけを数えて
-   `done/total` を導出する (タスク本文は読まない・送らない)。全量スナップショットなので重複発火しても冪等
-2. **TaskCreated / TaskCompleted hook (副経路)**: 公式イベントとして存在するが、
-   Agent Teams 系の `TaskCreate` ツール専用で、**TodoWrite では発火しない** (実測確認)。
-   将来のために登録済みで、`task_id` の一意集合 (Set) で管理するため重複通知でも二重加算されない
+1. **TaskCreated / TaskCompleted hook**: クリーン環境で起動したセッション (新 Task システム有効) では
+   `TaskCreate` / `TaskUpdate` ツールに連動して発火する (実測確認済み。payload に `task_id` あり)。
+   `task_id` の一意集合 (Set) で管理するため重複通知でも二重加算されない (上限 256 件/セッション)
+2. **TodoWrite スナップショット**: 旧 Todo システムのセッションでは PostToolUse payload の
+   `tool_input` 内の `"status"` 値の件数だけを数えて `completed/in_progress/total` を導出する
+   (タスク本文は読まない・送らない)。全量スナップショットなので重複発火しても冪等
 
-セッションの Task 状態は celebration 終了時 / SessionEnd 時に session ごと破棄される。
-task_id 集合は 1 セッションあたり最大 256 件で頭打ち。
+### 完了判定 (Phase 4.1)
+
+「終わったよ！」は「**ユーザーが投げた依頼全体が完了した**」ときだけ出す。
+
+- Task を使った依頼: Stop 受信時に未完 Task が残っていれば celebration せず
+  「**途中で止まったよ**」(StoppedIncomplete) を表示する。未完なのに完了と嘘をつかない
+- Task の無い依頼: 構造化された判定材料がないため、Stop を完了として扱う
+- 同一依頼への重複 Stop / 遅延イベントでは celebration は1回だけ (debounce + tombstone)
+- StoppedIncomplete は次の依頼 (UserPromptSubmit) で解除。終了済みセッションが表示を
+  塞ぎ続けないよう最大10分で自動消滅
+
+### Nested 子 Claude の通知抑制 (Phase 4.1)
+
+メイン Claude が Bash/PowerShell tool 内から起動した `claude -p` などの子 Claude は、
+**プロセス祖先チェーン**で検出して UI 通知を完全に抑制する (debug log には残る)。
+
+- 判定: hook helper の祖先プロセスに claude 本体が2つ以上あるか
+  (1つ目 = hook を発火させた claude 自身、2つ目 = それを起動した親 Claude)
+- 環境変数 (`CLAUDECODE` / `CLAUDE_CODE_SESSION_ID` 等) は親セッション自身も同じ値を持つため
+  判定に使えないことを実測で確認済み
+- PID 再利用による誤判定は「親の起動時刻 <= 子の起動時刻」検証で排除
+- 手動で開いた別ウィンドウの Claude は祖先に claude がいないため抑制されない (実測確認)
+- 制約: 子 Claude を起動した中間シェルが先に終了した場合は祖先チェーンが切れて
+  検出できないことがある (その場合は従来どおり通知される)。
+  また node.js 経由など exe 名が claude でない起動形態は検出できない
 
 ### 複数セッション
 
