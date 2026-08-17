@@ -1,15 +1,24 @@
 // ClaudePetNotify.exe - Claude Code Hook Adapter (tiny hook helper)
-// Claude Code の Stop hook から起動され、stdin の JSON から cwd を取り出し、
-// 常駐ペット (ClaudePet.exe) へ WM_COPYDATA で正規化イベントを送る。
-// ペット未起動時は同じフォルダの ClaudePet.exe を起動してから送る。
-// 常に exit code 0 で即終了し、Claude Code を絶対にブロックしない。
+// Claude Code の各 Hook から起動され、stdin の JSON から必要最小限のフィールド
+// (hook_event_name / session_id / cwd / agent_id) だけを取り出し、
+// 常駐ペット (ClaudePet.exe) へ WM_COPYDATA で正規化イベントを送って即終了する。
+// 常に exit code 0。Claude Code を絶対にブロックしない。
+//
+// 正規化イベント (dwData):
+//   1 = task_complete     (Stop)              ※ agent_id 付き(=subagent)は送らない
+//   2 = prompt_submit     (UserPromptSubmit)
+//   3 = permission_prompt (Notification: settings 側 matcher=permission_prompt で絞る)
+//   4 = activity          (PostToolUse)       ※ Waiting -> Working 解除用
+//   5 = session_end       (SessionEnd)
+// payload = "session_id\nproject_name" (UTF-8)
 //
 // 使い方:
-//   (hookから)  stdin に JSON  -> task_complete イベント送信
-//   --test [名前]              -> 手動テスト送信
-//   --quit                     -> 常駐ペットを終了させる
+//   (hookから)  stdin に JSON
+//   --test [名前]                  -> 完了イベントの手動テスト
+//   --send <type> <session> <名前> -> 任意イベントの手動テスト
+//   --quit                         -> 常駐ペットを終了させる
 //
-// プライバシー: cwd 以外の情報 (prompt本文・応答本文など) は一切読み取らない。
+// プライバシー: prompt 本文・応答本文・tool 入出力は一切読み取らない。
 
 using System;
 using System.Diagnostics;
@@ -26,7 +35,12 @@ namespace ClaudePetNotify
         private const string WndClassName = "ClaudeDesktopPetWnd";
         private const int WM_COPYDATA = 0x004A;
         private const int WM_CLOSE = 0x0010;
-        private const int EventTaskComplete = 1;
+
+        private const int EvTaskComplete = 1;
+        private const int EvPromptSubmit = 2;
+        private const int EvPermissionPrompt = 3;
+        private const int EvActivity = 4;
+        private const int EvSessionEnd = 5;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct COPYDATASTRUCT
@@ -39,7 +53,7 @@ namespace ClaudePetNotify
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, ref COPYDATASTRUCT lParam,
             uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
@@ -57,42 +71,115 @@ namespace ClaudePetNotify
                     return 0;
                 }
 
+                int eventType;
+                string sessionId;
                 string project;
+
                 if (args.Length > 0 && args[0] == "--test")
                 {
+                    eventType = EvTaskComplete;
+                    sessionId = "test-session";
                     project = args.Length > 1 ? args[1] : "test-project";
+                }
+                else if (args.Length > 2 && args[0] == "--send")
+                {
+                    int.TryParse(args[1], out eventType);
+                    sessionId = args[2];
+                    project = args.Length > 3 ? args[3] : "";
                 }
                 else
                 {
-                    string cwd = ReadCwdFromStdin();
-                    project = ToProjectName(cwd);
+                    string json = ReadStdin();
+                    string eventName = ExtractString(json, "hook_event_name");
+                    string agentId = ExtractString(json, "agent_id");
+                    sessionId = ExtractString(json, "session_id");
+                    project = ToProjectName(ExtractString(json, "cwd"));
+
+                    switch (eventName)
+                    {
+                        case "Stop":
+                            if (agentId.Length > 0) return 0; // 内部subagentの完了は通知しない
+                            eventType = EvTaskComplete;
+                            break;
+                        case "UserPromptSubmit":
+                            eventType = EvPromptSubmit;
+                            break;
+                        case "Notification":
+                            // settings 側 matcher=permission_prompt で発火を絞っている
+                            eventType = EvPermissionPrompt;
+                            break;
+                        case "PostToolUse":
+                            eventType = EvActivity;
+                            break;
+                        case "SessionEnd":
+                            eventType = EvSessionEnd;
+                            break;
+                        case "":
+                            eventType = EvTaskComplete; // 旧設定 (Stopのみ・event名なし想定) 互換
+                            break;
+                        default:
+                            return 0;
+                    }
                 }
 
-                IntPtr hwnd = EnsurePetRunning();
-                if (hwnd == IntPtr.Zero) return 0; // ペットを起動できなくても Claude は妨げない
+                // 頻度の高い低優先イベントではペットを起こさない (未起動なら捨てる)
+                bool mayAutoStart = (eventType == EvTaskComplete ||
+                                     eventType == EvPromptSubmit ||
+                                     eventType == EvPermissionPrompt);
 
-                SendEvent(hwnd, EventTaskComplete, project);
+                IntPtr hwnd = FindWindow(WndClassName, null);
+                if (hwnd == IntPtr.Zero)
+                {
+                    if (!mayAutoStart) { DebugLog(eventType, sessionId, project, "drop:no-pet"); return 0; }
+                    hwnd = StartPetAndWait();
+                    if (hwnd == IntPtr.Zero) { DebugLog(eventType, sessionId, project, "drop:start-fail"); return 0; }
+                }
+
+                bool ok = SendEvent(hwnd, eventType, sessionId + "\n" + project);
+                DebugLog(eventType, sessionId, project, ok ? "sent" : "SEND-FAIL err=" + Marshal.GetLastWin32Error());
             }
             catch { }
             return 0;
         }
 
-        // stdin JSON から "cwd" だけを抽出する。完全な JSON parser は使わない (軽量化)。
-        private static string ReadCwdFromStdin()
+        // bin\debug.flag が存在するときだけ bin\debug.log へイベントを追記する (通常は完全に無効)
+        private static void DebugLog(int eventType, string sessionId, string project, string note)
         {
-            string json = "";
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    string dir = AppDomain.CurrentDomain.BaseDirectory;
+                    if (!File.Exists(Path.Combine(dir, "debug.flag"))) return;
+                    File.AppendAllText(Path.Combine(dir, "debug.log"),
+                        DateTime.Now.ToString("HH:mm:ss.fff") + " ev=" + eventType +
+                        " sess=" + sessionId + " proj=" + project + " " + note + "\r\n");
+                    return;
+                }
+                catch { Thread.Sleep(20); } // 併走する別Hookプロセスと書き込みが衝突したら少し待つ
+            }
+        }
+
+        private static string ReadStdin()
+        {
             try
             {
                 using (Stream s = Console.OpenStandardInput())
                 using (var reader = new StreamReader(s, Encoding.UTF8))
                 {
-                    json = reader.ReadToEnd();
+                    return reader.ReadToEnd();
                 }
             }
-            catch { }
-            if (string.IsNullOrEmpty(json)) return "";
+            catch { return ""; }
+        }
 
-            Match m = Regex.Match(json, "\"cwd\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+        // JSON から文字列フィールドを1つ抽出する (完全な parser は使わない軽量方式)。
+        // 制約: 巨大 text フィールド内に同名の "key":"..." が現れると誤抽出しうるが、
+        // 抽出対象は表示・振り分け用途のみで、実害が出ない範囲として許容する。
+        private static string ExtractString(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json)) return "";
+            Match m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
             if (!m.Success) return "";
             return Unescape(m.Groups[1].Value);
         }
@@ -145,11 +232,8 @@ namespace ClaudePetNotify
             catch { return ""; }
         }
 
-        private static IntPtr EnsurePetRunning()
+        private static IntPtr StartPetAndWait()
         {
-            IntPtr hwnd = FindWindow(WndClassName, null);
-            if (hwnd != IntPtr.Zero) return hwnd;
-
             try
             {
                 string dir = AppDomain.CurrentDomain.BaseDirectory;
@@ -165,13 +249,13 @@ namespace ClaudePetNotify
             for (int i = 0; i < 30; i++)
             {
                 Thread.Sleep(100);
-                hwnd = FindWindow(WndClassName, null);
+                IntPtr hwnd = FindWindow(WndClassName, null);
                 if (hwnd != IntPtr.Zero) return hwnd;
             }
             return IntPtr.Zero;
         }
 
-        private static void SendEvent(IntPtr hwnd, int eventType, string payload)
+        private static bool SendEvent(IntPtr hwnd, int eventType, string payload)
         {
             byte[] bytes = Encoding.UTF8.GetBytes(payload ?? "");
             IntPtr mem = Marshal.AllocHGlobal(bytes.Length + 1);
@@ -186,8 +270,9 @@ namespace ClaudePetNotify
                 cds.lpData = mem;
 
                 IntPtr result;
-                // SMTO_ABORTIFHUNG | SMTO_BLOCK 相当: 1秒で諦める。Hookを長引かせない。
-                SendMessageTimeout(hwnd, WM_COPYDATA, IntPtr.Zero, ref cds, 0x0002, 1000, out result);
+                // SMTO_ABORTIFHUNG: 1秒で諦める。Hookを長引かせない。
+                IntPtr ret = SendMessageTimeout(hwnd, WM_COPYDATA, IntPtr.Zero, ref cds, 0x0002, 1000, out result);
+                return ret != IntPtr.Zero;
             }
             finally
             {

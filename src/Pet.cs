@@ -3,11 +3,18 @@
 // 描画は System.Drawing で ARGB ビットマップを合成し UpdateLayeredWindow で反映。
 // タイマーはアニメーション中のみ SetTimer し、終了後は必ず KillTimer する。
 //
-// 状態遷移:  Idle --(WM_COPYDATA: task_complete)--> Celebrating(bounce) --> Message表示 --(約5秒)--> Idle
+// 状態遷移 (session_id 単位):
+//   (なし) --UserPromptSubmit--> Working --permission_prompt--> Waiting
+//   Waiting --PostToolUse/UserPromptSubmit--> Working
+//   Working/Waiting --Stop--> Celebrating --(バウンド+約5秒)--> (エントリ削除=Idle)
+//   SessionEnd --> エントリ削除
+//
+// 表示は常にペット1匹。優先度 Waiting > Celebrating > Working、同率は最新イベントの session。
 //
 // C# 5 (.NET Framework 4.8 同梱 csc.exe) でビルド可能な構文のみ使用。
 
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
@@ -39,7 +46,8 @@ namespace ClaudePet
         public const int SWP_NOACTIVATE = 0x0010;
         public const int SWP_NOZORDER = 0x0004;
 
-        public const uint MB_OK_SOUND = 0x00000000;
+        public const uint SOUND_DEFAULT = 0x00000000;      // 完了音 (既定のビープ)
+        public const uint SOUND_EXCLAMATION = 0x00000030;  // 確認待ち音 (Windows 警告音・完了音と別)
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int x; public int y; public POINT(int ax, int ay) { x = ax; y = ay; } }
@@ -185,32 +193,58 @@ namespace ClaudePet
     // Hook Adapter から届く正規化イベント (WM_COPYDATA の dwData)
     internal static class PetEvent
     {
-        public const int TaskComplete = 1;
+        public const int TaskComplete = 1;      // Stop
+        public const int PromptSubmit = 2;      // UserPromptSubmit
+        public const int PermissionPrompt = 3;  // Notification (notification_type=permission_prompt)
+        public const int Activity = 4;          // PostToolUse (Waiting解除用)
+        public const int SessionEnd = 5;        // SessionEnd
+    }
+
+    internal sealed class Session
+    {
+        public const int Working = 1;
+        public const int Waiting = 2;
+        public const int Celebrating = 3;
+
+        public string Project;
+        public int State;
+        public long LastSeq;        // 単調増加のイベント順序
+        public DateTime LastAtUtc;  // 古いエントリ掃除用
     }
 
     internal sealed class PetApp
     {
         private const string WndClassName = "ClaudeDesktopPetWnd";
 
-        // アニメーション用タイマーID
         private static readonly IntPtr TimerBounce = new IntPtr(1);
         private static readonly IntPtr TimerRevert = new IntPtr(2);
 
         private const int BounceIntervalMs = 30;
-        private const int BounceFrames = 44;      // 約1.3秒で3回バウンド
-        private const int RevertDelayMs = 3700;   // バウンド後、メッセージ表示継続時間
+        private const int RevertDelayMs = 3700;        // 完了バウンド後のメッセージ表示継続時間
+        private const int RevertDelayHiddenMs = 5000;  // 非表示セッションの完了エントリ掃除
+
+        private const int MaxSessions = 8;             // 通常同時利用は数セッション。無制限に増やさない
+        private static readonly TimeSpan StaleAfter = TimeSpan.FromHours(4);
+
+        private const int AnimNone = 0;
+        private const int AnimCelebrate = 1;  // 3回大きくバウンド
+        private const int AnimLight = 2;      // 2回控えめにピョコッ
 
         private IntPtr _hwnd;
         private Native.WndProcDelegate _wndProc; // GC防止のためフィールドで保持
         private float _scale = 1f;
 
-        // レイアウト (96dpi基準、_scale倍して使用)
         private int _winW;
         private int _winH;
         private int _baseX;
         private int _baseY;
 
+        private int _animMode = AnimNone;
         private int _bounceFrame;
+
+        private readonly Dictionary<string, Session> _sessions = new Dictionary<string, Session>();
+        private long _seq;
+        private string _shownKey = ""; // 直前に描画した (session|state|project)。同一なら再描画しない
 
         [STAThread]
         private static void Main()
@@ -254,10 +288,7 @@ namespace ClaudePet
                 _baseX, _baseY, _winW, _winH,
                 IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
 
-            using (Bitmap idle = PetRenderer.RenderIdle(_winW, _winH, _scale))
-            {
-                ApplyBitmap(idle, _baseX, _baseY);
-            }
+            RenderCurrent(true);
             Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
 
             TrimMemory();
@@ -309,66 +340,270 @@ namespace ClaudePet
             return Native.DefWindowProc(hWnd, msg, wParam, lParam);
         }
 
+        // ---- イベント処理 -------------------------------------------------
+
         private void HandleCopyData(IntPtr lParam)
         {
             try
             {
                 var cds = (Native.COPYDATASTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.COPYDATASTRUCT));
-                if (cds.dwData.ToInt64() != PetEvent.TaskComplete) return;
+                int eventType = (int)cds.dwData.ToInt64();
 
+                string sessionId = "";
                 string project = "";
                 if (cds.cbData > 0 && cds.lpData != IntPtr.Zero)
                 {
                     byte[] buf = new byte[cds.cbData];
                     Marshal.Copy(cds.lpData, buf, 0, cds.cbData);
-                    project = System.Text.Encoding.UTF8.GetString(buf).TrimEnd('\0');
+                    string payload = System.Text.Encoding.UTF8.GetString(buf).TrimEnd('\0');
+                    int nl = payload.IndexOf('\n');
+                    if (nl >= 0)
+                    {
+                        sessionId = payload.Substring(0, nl);
+                        project = payload.Substring(nl + 1);
+                    }
+                    else project = payload;
                 }
-                StartCelebrate(project);
+                if (sessionId.Length == 0) sessionId = "(default)";
+
+                OnEvent(eventType, sessionId, project);
+                PetDebug("recv ev=" + eventType + " sess=" + sessionId + " -> shown=" + _shownKey);
+            }
+            catch (Exception ex) { PetDebug("recv-error " + ex.GetType().Name + " " + ex.Message); }
+        }
+
+        // bin\debug.flag が存在するときだけ bin\debug.log へ追記 (通常は完全に無効)
+        private static void PetDebug(string line)
+        {
+            try
+            {
+                string dir = AppDomain.CurrentDomain.BaseDirectory;
+                if (!System.IO.File.Exists(System.IO.Path.Combine(dir, "debug.flag"))) return;
+                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "debug.log"),
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " [pet] " + line + "\r\n");
             }
             catch { }
         }
 
-        private void StartCelebrate(string project)
+        private void OnEvent(int eventType, string sessionId, string project)
         {
-            // 連続通知時は最初からやり直す
-            Native.KillTimer(_hwnd, TimerBounce);
-            Native.KillTimer(_hwnd, TimerRevert);
+            _seq++;
+            Session s;
+            _sessions.TryGetValue(sessionId, out s);
 
-            using (Bitmap bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, project))
+            bool becameWaiting = false;
+            bool becameCelebrating = false;
+
+            switch (eventType)
             {
-                ApplyBitmap(bmp, _baseX, _baseY);
+                case PetEvent.PromptSubmit:
+                    s = Upsert(sessionId, s, project, true);
+                    s.State = Session.Working;
+                    break;
+
+                case PetEvent.Activity:
+                    // Celebrating 中の残イベントでは状態を戻さない
+                    if (s != null && s.State == Session.Celebrating) { Touch(s, project); break; }
+                    // PostToolUse の cwd はツール実行ディレクトリで揺れることがあるため
+                    // project 名は上書きしない (最初に確定した名前を維持)
+                    s = Upsert(sessionId, s, project, false);
+                    s.State = Session.Working;
+                    break;
+
+                case PetEvent.PermissionPrompt:
+                    bool wasWaiting = (s != null && s.State == Session.Waiting);
+                    s = Upsert(sessionId, s, project, true);
+                    s.State = Session.Waiting;
+                    becameWaiting = !wasWaiting; // debounce: 既にWaitingなら音もアニメも出さない
+                    break;
+
+                case PetEvent.TaskComplete:
+                    s = Upsert(sessionId, s, project, true);
+                    s.State = Session.Celebrating;
+                    becameCelebrating = true;
+                    break;
+
+                case PetEvent.SessionEnd:
+                    // Celebrating 中は即削除しない (claude -p 終了時の SessionEnd が
+                    // 完了通知を打ち消してしまうため)。revert タイマーが後で掃除する。
+                    if (s != null && s.State != Session.Celebrating) _sessions.Remove(sessionId);
+                    break;
+
+                default:
+                    return;
             }
+            if (s != null) Touch(s, project);
 
-            Native.MessageBeep(Native.MB_OK_SOUND);
+            Prune();
 
+            // 音は表示中かどうかに関わらず状態遷移時のみ1回
+            if (becameCelebrating) Native.MessageBeep(Native.SOUND_DEFAULT);
+            else if (becameWaiting) Native.MessageBeep(Native.SOUND_EXCLAMATION);
+
+            string displayId = ComputeDisplaySession();
+            RenderCurrent(false);
+
+            bool displayed = (displayId == sessionId);
+            if (becameCelebrating)
+            {
+                if (displayed) StartBounce(AnimCelebrate);
+                else Native.SetTimer(_hwnd, TimerRevert, RevertDelayHiddenMs, IntPtr.Zero);
+            }
+            else if (becameWaiting && displayed)
+            {
+                StartBounce(AnimLight);
+            }
+        }
+
+        private Session Upsert(string sessionId, Session s, string project, bool projectAuthoritative)
+        {
+            if (s == null)
+            {
+                s = new Session();
+                _sessions[sessionId] = s;
+            }
+            if (!string.IsNullOrEmpty(project) &&
+                (projectAuthoritative || string.IsNullOrEmpty(s.Project)))
+            {
+                s.Project = project;
+            }
+            return s;
+        }
+
+        private void Touch(Session s, string project)
+        {
+            s.LastSeq = _seq;
+            s.LastAtUtc = DateTime.UtcNow;
+        }
+
+        private void Prune()
+        {
+            List<string> remove = null;
+            DateTime now = DateTime.UtcNow;
+            foreach (var kv in _sessions)
+            {
+                if (now - kv.Value.LastAtUtc > StaleAfter)
+                {
+                    if (remove == null) remove = new List<string>();
+                    remove.Add(kv.Key);
+                }
+            }
+            if (remove != null) foreach (string k in remove) _sessions.Remove(k);
+
+            while (_sessions.Count > MaxSessions)
+            {
+                string oldest = null;
+                long oldestSeq = long.MaxValue;
+                foreach (var kv in _sessions)
+                {
+                    if (kv.Value.LastSeq < oldestSeq) { oldestSeq = kv.Value.LastSeq; oldest = kv.Key; }
+                }
+                if (oldest == null) break;
+                _sessions.Remove(oldest);
+            }
+        }
+
+        // 表示priority: Waiting > Celebrating > Working。同率は最新イベントのsession。
+        private string ComputeDisplaySession()
+        {
+            string bestId = null;
+            int bestRank = 0;
+            long bestSeq = -1;
+            foreach (var kv in _sessions)
+            {
+                int rank = RankOf(kv.Value.State);
+                if (rank > bestRank || (rank == bestRank && kv.Value.LastSeq > bestSeq))
+                {
+                    bestRank = rank;
+                    bestSeq = kv.Value.LastSeq;
+                    bestId = kv.Key;
+                }
+            }
+            return bestId;
+        }
+
+        private static int RankOf(int state)
+        {
+            switch (state)
+            {
+                case Session.Waiting: return 3;
+                case Session.Celebrating: return 2;
+                case Session.Working: return 1;
+                default: return 0;
+            }
+        }
+
+        // ---- 描画 ---------------------------------------------------------
+
+        private void RenderCurrent(bool force)
+        {
+            string id = ComputeDisplaySession();
+            Session s = (id != null) ? _sessions[id] : null;
+            string key = (s == null) ? "idle" : id + "|" + s.State + "|" + (s.Project ?? "");
+            if (!force && key == _shownKey) return; // 同一表示なら再描画しない (PostToolUse連発対策)
+            _shownKey = key;
+
+            Bitmap bmp;
+            if (s == null) bmp = PetRenderer.RenderIdle(_winW, _winH, _scale);
+            else if (s.State == Session.Waiting) bmp = PetRenderer.RenderWaiting(_winW, _winH, _scale, s.Project);
+            else if (s.State == Session.Celebrating) bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project);
+            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project);
+
+            using (bmp) { ApplyBitmap(bmp, _baseX, _baseY); }
+
+            if (_animMode == AnimNone) MoveTo(_baseX, _baseY);
+        }
+
+        // ---- アニメーション ------------------------------------------------
+
+        private void StartBounce(int mode)
+        {
+            Native.KillTimer(_hwnd, TimerBounce);
+            _animMode = mode;
             _bounceFrame = 0;
             Native.SetTimer(_hwnd, TimerBounce, BounceIntervalMs, IntPtr.Zero);
         }
 
         private void OnBounceTick()
         {
+            int totalFrames = (_animMode == AnimCelebrate) ? 44 : 22; // 約1.3秒 / 約0.65秒
+            int bounces = (_animMode == AnimCelebrate) ? 3 : 2;
+            int amplitude = (_animMode == AnimCelebrate) ? S(22) : S(10);
+
             _bounceFrame++;
-            if (_bounceFrame >= BounceFrames)
+            if (_bounceFrame >= totalFrames)
             {
                 Native.KillTimer(_hwnd, TimerBounce);
                 MoveTo(_baseX, _baseY);
-                // メッセージをしばらく表示してから静止状態へ戻す
-                Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
+                bool wasCelebrate = (_animMode == AnimCelebrate);
+                _animMode = AnimNone;
+                if (wasCelebrate)
+                {
+                    // メッセージをしばらく表示してから静止状態へ戻す
+                    Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
+                }
                 return;
             }
-            double t = (double)_bounceFrame / BounceFrames;
-            int offset = (int)(S(22) * Math.Abs(Math.Sin(t * Math.PI * 3.0)));
+            double t = (double)_bounceFrame / totalFrames;
+            int offset = (int)(amplitude * Math.Abs(Math.Sin(t * Math.PI * bounces)));
             MoveTo(_baseX, _baseY - offset);
         }
 
         private void OnRevert()
         {
             Native.KillTimer(_hwnd, TimerRevert);
-            using (Bitmap idle = PetRenderer.RenderIdle(_winW, _winH, _scale))
+            List<string> done = null;
+            foreach (var kv in _sessions)
             {
-                ApplyBitmap(idle, _baseX, _baseY);
+                if (kv.Value.State == Session.Celebrating)
+                {
+                    if (done == null) done = new List<string>();
+                    done.Add(kv.Key);
+                }
             }
-            MoveTo(_baseX, _baseY);
+            if (done != null) foreach (string k in done) _sessions.Remove(k);
+
+            RenderCurrent(false); // 残っている Waiting / Working セッションの表示へ戻る
             TrimMemory();
         }
 
@@ -432,7 +667,39 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawLabel(g, w, h, scale);
+                DrawLabel(g, w, h, scale, "Claude");
+            }
+            return bmp;
+        }
+
+        // Working: 吹き出しなしの控えめなピル + 「作業中…」
+        public static Bitmap RenderWorking(int w, int h, float scale, string project)
+        {
+            Bitmap bmp = NewCanvas(w, h);
+            using (Graphics g = NewGraphics(bmp))
+            {
+                DrawChick(g, w, h, scale);
+                DrawPill(g, w, scale, "作業中…", project,
+                    Color.FromArgb(205, 250, 250, 248),   // 背景: 静かな白
+                    Color.FromArgb(255, 210, 205, 196),   // 枠: 薄いグレー
+                    Color.FromArgb(255, 100, 92, 84),     // 文字: グレー
+                    false, 15f);
+            }
+            return bmp;
+        }
+
+        // Waiting: 警告色の吹き出し + 「確認して！」 (完了と明確に区別)
+        public static Bitmap RenderWaiting(int w, int h, float scale, string project)
+        {
+            Bitmap bmp = NewCanvas(w, h);
+            using (Graphics g = NewGraphics(bmp))
+            {
+                DrawChick(g, w, h, scale);
+                DrawPill(g, w, scale, "確認して！", project,
+                    Color.FromArgb(242, 255, 243, 214),   // 背景: 淡い黄
+                    Color.FromArgb(255, 226, 160, 66),    // 枠: オレンジ
+                    Color.FromArgb(255, 168, 96, 24),     // 文字: 濃いオレンジ
+                    true, 18f);
             }
             return bmp;
         }
@@ -443,7 +710,11 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawBubble(g, w, h, scale, project);
+                DrawPill(g, w, scale, "終わったよ！", project,
+                    Color.FromArgb(238, 255, 255, 255),   // 背景: 白
+                    Color.FromArgb(255, 205, 198, 188),   // 枠: グレー
+                    Color.FromArgb(255, 70, 62, 54),      // 文字: 濃いグレー
+                    true, 19f);
             }
             return bmp;
         }
@@ -516,49 +787,55 @@ namespace ClaudePet
             }
         }
 
-        private static void DrawLabel(Graphics g, int w, int h, float scale)
+        private static void DrawLabel(Graphics g, int w, int h, float scale, string text)
         {
             using (var font = new Font("Yu Gothic UI", 10.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
             using (var brush = new SolidBrush(Color.FromArgb(150, 90, 84, 76)))
             using (var fmt = new StringFormat())
             {
                 fmt.Alignment = StringAlignment.Center;
-                g.DrawString("Claude", font, brush, w / 2f, h - 24 * scale, fmt);
+                g.DrawString(text, font, brush, w / 2f, h - 24 * scale, fmt);
             }
         }
 
-        private static void DrawBubble(Graphics g, int w, int h, float scale, string project)
+        // キャラ上部の吹き出し/ピル。tail=true で吹き出しのしっぽ付き。
+        private static void DrawPill(Graphics g, int w, float scale, string mainText, string project,
+            Color bg, Color border, Color textColor, bool tail, float mainSize)
         {
             float bx = 24 * scale;
             float by = 14 * scale;
             float bw = w - 48 * scale;
-            float bh = string.IsNullOrEmpty(project) ? 56 * scale : 76 * scale;
+            bool hasProject = !string.IsNullOrEmpty(project);
+            float bh = (hasProject ? 76 : 56) * scale;
             float rad = 12 * scale;
 
             using (GraphicsPath path = RoundedRect(bx, by, bw, bh, rad))
             {
-                // 吹き出しのしっぽ
-                path.AddPolygon(new PointF[]
+                if (tail)
                 {
-                    new PointF(w / 2f - 8 * scale, by + bh - 1),
-                    new PointF(w / 2f + 8 * scale, by + bh - 1),
-                    new PointF(w / 2f, by + bh + 10 * scale)
-                });
-                using (var bg = new SolidBrush(Color.FromArgb(238, 255, 255, 255)))
-                    g.FillPath(bg, path);
-                using (var border = new Pen(Color.FromArgb(255, 205, 198, 188), 1.5f * scale))
-                    g.DrawPath(border, path);
+                    path.AddPolygon(new PointF[]
+                    {
+                        new PointF(w / 2f - 8 * scale, by + bh - 1),
+                        new PointF(w / 2f + 8 * scale, by + bh - 1),
+                        new PointF(w / 2f, by + bh + 10 * scale)
+                    });
+                }
+                using (var bgBrush = new SolidBrush(bg))
+                    g.FillPath(bgBrush, path);
+                using (var borderPen = new Pen(border, 1.5f * scale))
+                    g.DrawPath(borderPen, path);
             }
 
             using (var fmt = new StringFormat())
             {
                 fmt.Alignment = StringAlignment.Center;
-                using (var font = new Font("Yu Gothic UI", 19f * scale, FontStyle.Bold, GraphicsUnit.Pixel))
-                using (var brush = new SolidBrush(Color.FromArgb(255, 70, 62, 54)))
+                float mainY = by + (hasProject ? 12 : 14) * scale;
+                using (var font = new Font("Yu Gothic UI", mainSize * scale, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var brush = new SolidBrush(textColor))
                 {
-                    g.DrawString("終わったよ！", font, brush, w / 2f, by + 12 * scale, fmt);
+                    g.DrawString(mainText, font, brush, w / 2f, mainY, fmt);
                 }
-                if (!string.IsNullOrEmpty(project))
+                if (hasProject)
                 {
                     using (var font = new Font("Yu Gothic UI", 13f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                     using (var brush = new SolidBrush(Color.FromArgb(255, 130, 122, 112)))

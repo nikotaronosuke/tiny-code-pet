@@ -1,4 +1,4 @@
-# uninstall-hook.ps1 - Remove the ClaudePetNotify Stop hook from user-level Claude Code settings.
+# uninstall-hook.ps1 - Remove all ClaudePetNotify hooks from user-level Claude Code settings.
 # Only removes hook entries whose command contains "ClaudePetNotify"; everything else is untouched.
 # Creates a timestamped backup of settings.json first.
 # NOTE: keep this file ASCII-only. Prefer running with pwsh (PowerShell 7).
@@ -13,37 +13,39 @@ Copy-Item $settingsPath $backup
 Write-Host "Backup created: $backup"
 
 $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
-if (-not ($settings.PSObject.Properties.Name -contains "hooks") -or
-    -not ($settings.hooks.PSObject.Properties.Name -contains "Stop")) {
-    Write-Host "No Stop hooks registered; nothing to do."
+if (-not ($settings.PSObject.Properties.Name -contains "hooks")) {
+    Write-Host "No hooks registered; nothing to do."
     exit 0
 }
 
-$newStop = @()
 $removed = 0
-foreach ($group in @($settings.hooks.Stop)) {
-    $kept = @()
-    foreach ($h in @($group.hooks)) {
-        if ($h.command -like "*ClaudePetNotify*") { $removed++ } else { $kept += $h }
+$eventNames = @($settings.hooks.PSObject.Properties.Name)
+foreach ($ev in $eventNames) {
+    $newGroups = @()
+    foreach ($group in @($settings.hooks.$ev)) {
+        $kept = @()
+        foreach ($h in @($group.hooks)) {
+            if ($h.command -like "*ClaudePetNotify*") { $removed++ } else { $kept += $h }
+        }
+        if ($kept.Count -gt 0) {
+            $group.hooks = $kept
+            $newGroups += $group
+        }
     }
-    if ($kept.Count -gt 0) {
-        $group.hooks = $kept
-        $newStop += $group
+    if ($newGroups.Count -gt 0) {
+        $settings.hooks.$ev = $newGroups
+    } else {
+        $settings.hooks.PSObject.Properties.Remove($ev)
     }
 }
 
 if ($removed -eq 0) {
-    Write-Host "ClaudePetNotify hook not found; nothing changed."
+    Write-Host "ClaudePetNotify hooks not found; nothing changed."
     exit 0
 }
 
-if ($newStop.Count -gt 0) {
-    $settings.hooks.Stop = $newStop
-} else {
-    $settings.hooks.PSObject.Properties.Remove("Stop")
-    if ($settings.hooks.PSObject.Properties.Name.Count -eq 0) {
-        $settings.PSObject.Properties.Remove("hooks")
-    }
+if ($settings.hooks.PSObject.Properties.Name.Count -eq 0) {
+    $settings.PSObject.Properties.Remove("hooks")
 }
 
 $json = $settings | ConvertTo-Json -Depth 64

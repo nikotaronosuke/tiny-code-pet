@@ -1,5 +1,6 @@
-# install-hook.ps1 - Register ClaudePetNotify.exe as a user-level Claude Code Stop hook.
-# - Never overwrites existing hooks: appends only, idempotent.
+# install-hook.ps1 - Register ClaudePetNotify.exe hooks in user-level Claude Code settings.
+# Events: Stop, UserPromptSubmit, Notification(permission_prompt), PostToolUse(*), SessionEnd.
+# - Never overwrites existing hooks: appends only, idempotent per event.
 # - Creates a timestamped backup of settings.json first.
 # NOTE: keep this file ASCII-only. Prefer running with pwsh (PowerShell 7).
 $ErrorActionPreference = "Stop"
@@ -24,35 +25,54 @@ if (Test-Path $settingsPath) {
 if (-not ($settings.PSObject.Properties.Name -contains "hooks")) {
     $settings | Add-Member -MemberType NoteProperty -Name "hooks" -Value ([pscustomobject]@{})
 }
-if (-not ($settings.hooks.PSObject.Properties.Name -contains "Stop")) {
-    $settings.hooks | Add-Member -MemberType NoteProperty -Name "Stop" -Value @()
+
+function New-HookEntry([string]$cmd, [object]$matcher) {
+    $inner = [pscustomobject]@{
+        type    = "command"
+        command = $cmd
+        timeout = 10
+        async   = $true
+    }
+    if ($null -ne $matcher) {
+        return [pscustomobject]@{ matcher = $matcher; hooks = @($inner) }
+    }
+    return [pscustomobject]@{ hooks = @($inner) }
 }
 
-# Idempotency: skip if already registered.
-$already = $false
-foreach ($group in @($settings.hooks.Stop)) {
-    foreach ($h in @($group.hooks)) {
-        if ($h.command -like "*ClaudePetNotify*") { $already = $true }
+# event name -> matcher ($null = no matcher field)
+$events = [ordered]@{
+    "Stop"             = $null
+    "UserPromptSubmit" = $null
+    "Notification"     = "permission_prompt"
+    "PostToolUse"      = "*"
+    "SessionEnd"       = $null
+}
+
+$changed = $false
+foreach ($ev in $events.Keys) {
+    if (-not ($settings.hooks.PSObject.Properties.Name -contains $ev)) {
+        $settings.hooks | Add-Member -MemberType NoteProperty -Name $ev -Value @()
+    }
+    $already = $false
+    foreach ($group in @($settings.hooks.$ev)) {
+        foreach ($h in @($group.hooks)) {
+            if ($h.command -like "*ClaudePetNotify*") { $already = $true }
+        }
+    }
+    if ($already) {
+        Write-Host "$ev : already installed, skipped"
+    } else {
+        $settings.hooks.$ev = @($settings.hooks.$ev) + @((New-HookEntry $hookCommand $events[$ev]))
+        Write-Host "$ev : installed"
+        $changed = $true
     }
 }
 
-if ($already) {
-    Write-Host "Already installed. Nothing changed."
-} else {
-    $entry = [pscustomobject]@{
-        hooks = @(
-            [pscustomobject]@{
-                type    = "command"
-                command = $hookCommand
-                timeout = 10
-                async   = $true
-            }
-        )
-    }
-    $settings.hooks.Stop = @($settings.hooks.Stop) + @($entry)
-
+if ($changed) {
     $json = $settings | ConvertTo-Json -Depth 64
     # Write UTF-8 WITHOUT BOM (a BOM can break JSON parsers).
     [System.IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "Installed Stop hook -> $hookCommand"
+    Write-Host "Settings updated: $settingsPath"
+} else {
+    Write-Host "Nothing changed."
 }
