@@ -41,9 +41,11 @@ namespace ClaudePetNotify
         private const int EvPermissionPrompt = 3;
         private const int EvActivity = 4;
         private const int EvSessionEnd = 5;
-        private const int EvTaskCreated = 6;    // TaskCreated (Agent Teams系 TaskCreate)
-        private const int EvTaskCompleted = 7;  // TaskCompleted
-        private const int EvTaskSnapshot = 8;   // PostToolUse(TodoWrite) から導出した "done/total"
+        private const int EvTaskCreated = 6;    // TaskCreated hook (extra=task_id)
+        private const int EvTaskCompleted = 7;  // TaskCompleted hook / TaskUpdate(completed) (extra=task_id)
+        private const int EvTaskSnapshot = 8;   // PostToolUse(TodoWrite) から導出した "c/i/t"
+        private const int EvTaskRemoved = 9;    // TaskUpdate(deleted/cancelled)。削除はhookが発火しない (実測)
+        private const int EvTaskInProgress = 10; // TaskUpdate(in_progress) (extra=task_id)
 
         [StructLayout(LayoutKind.Sequential)]
         private struct COPYDATASTRUCT
@@ -232,12 +234,33 @@ namespace ClaudePetNotify
                             break;
                         case "PostToolUse":
                             eventType = EvActivity;
-                            // TodoWrite (メインセッションのみ) は進捗スナップショットとして送る。
-                            // subagent の todo list は agent_id 付きなので混ぜない。
-                            if (agentId.Length == 0 && ExtractString(json, "tool_name") == "TodoWrite")
+                            string toolName = ExtractString(json, "tool_name");
+                            if (agentId.Length == 0)
                             {
-                                string counts = CountTodoStatuses(json);
-                                if (counts != null) { eventType = EvTaskSnapshot; extra = counts; }
+                                if (toolName == "TodoWrite")
+                                {
+                                    // TodoWrite (メインセッションのみ) は進捗スナップショット。
+                                    // subagent の todo list は agent_id 付きなので混ぜない。
+                                    string counts = CountTodoStatuses(json);
+                                    if (counts != null) { eventType = EvTaskSnapshot; extra = counts; }
+                                }
+                                else if (toolName == "TaskUpdate")
+                                {
+                                    // 削除 (deleted/cancelled) は対応する hook が発火しないため
+                                    // ここで検知して total から除外する (false incomplete の主因)。
+                                    // completed は TaskCompleted hook の取りこぼし保険 (Set で冪等)。
+                                    string tid, status;
+                                    ParseTaskUpdate(json, out tid, out status);
+                                    if (tid.Length > 0)
+                                    {
+                                        if (status == "deleted" || status == "cancelled")
+                                        { eventType = EvTaskRemoved; extra = tid; }
+                                        else if (status == "in_progress")
+                                        { eventType = EvTaskInProgress; extra = tid; }
+                                        else if (status == "completed")
+                                        { eventType = EvTaskCompleted; extra = tid; }
+                                    }
+                                }
                             }
                             break;
                         case "TaskCreated":
@@ -302,22 +325,24 @@ namespace ClaudePetNotify
             return sb.ToString();
         }
 
-        // bin\debug.flag が存在するときだけ bin\debug.log へイベントを追記する (通常は完全に無効)
+        // bin\debug.flag が存在するときだけ bin\debug.log へイベントを追記する (通常は完全に無効)。
+        // 併走プロセスと衝突しないよう FileShare.ReadWrite の追記ストリームを使う。
         private static void DebugLog(int eventType, string sessionId, string project, string note)
         {
-            for (int attempt = 0; attempt < 3; attempt++)
+            try
             {
-                try
+                string dir = AppDomain.CurrentDomain.BaseDirectory;
+                if (!File.Exists(Path.Combine(dir, "debug.flag"))) return;
+                byte[] line = Encoding.UTF8.GetBytes(
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " ev=" + eventType +
+                    " sess=" + sessionId + " proj=" + project + " " + note + "\r\n");
+                using (var fs = new FileStream(Path.Combine(dir, "debug.log"),
+                    FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
                 {
-                    string dir = AppDomain.CurrentDomain.BaseDirectory;
-                    if (!File.Exists(Path.Combine(dir, "debug.flag"))) return;
-                    File.AppendAllText(Path.Combine(dir, "debug.log"),
-                        DateTime.Now.ToString("HH:mm:ss.fff") + " ev=" + eventType +
-                        " sess=" + sessionId + " proj=" + project + " " + note + "\r\n");
-                    return;
+                    fs.Write(line, 0, line.Length);
                 }
-                catch { Thread.Sleep(20); } // 併走する別Hookプロセスと書き込みが衝突したら少し待つ
             }
+            catch { }
         }
 
         private static string ReadStdin()
@@ -399,6 +424,20 @@ namespace ClaudePetNotify
                 else if (m.Groups[1].Value == "in_progress") inProg++;
             }
             return done + "/" + inProg + "/" + total;
+        }
+
+        // TaskUpdate の tool_input から taskId と status だけを取り出す (本文は読まない)
+        private static void ParseTaskUpdate(string json, out string taskId, out string status)
+        {
+            taskId = ""; status = "";
+            int start = json.IndexOf("\"tool_input\"", StringComparison.Ordinal);
+            if (start < 0) return;
+            int end = json.IndexOf("\"tool_response\"", start, StringComparison.Ordinal);
+            string region = (end > start) ? json.Substring(start, end - start) : json.Substring(start);
+            Match mi = Regex.Match(region, "\"(?:taskId|task_id)\"\\s*:\\s*\"([^\"]{1,64})\"");
+            if (mi.Success) taskId = mi.Groups[1].Value;
+            Match ms = Regex.Match(region, "\"status\"\\s*:\\s*\"([a-z_]{1,20})\"");
+            if (ms.Success) status = ms.Groups[1].Value;
         }
 
         private static string ToProjectName(string cwd)

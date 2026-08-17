@@ -9,15 +9,20 @@ Claude Code の状態を、デスクトップ右下の小さなひよこを見�
 | Working | 🐣 + 「作業中…」+ project名 | 放置してよい (グレーのピル・静止) |
 | Working (Taskあり) | 🐣 + 「作業中…」+ progress bar + 「**全体 推定 N%**」+ project名 | 今投げた依頼全体のおおよその進み具合。Task 件数 (3/5 等) は表示しない |
 | Waiting | 🐣 + 「確認して！」+ project名 | **permission承認待ち。見に行く必要あり** (オレンジ吹き出し・軽く2回ピョコ・警告音1回) |
-| StoppedIncomplete | 🐣 + 「途中で止まったよ」+ project名 | **Stop したが Task が未完のまま**。完了とは扱わない (ベージュ吹き出し・警告音1回・最大10分表示) |
+| StoppedIncomplete | 🐣 + 「途中で止まったよ」+ project名 | **未着手 Task を残したまま停止** (ベージュ吹き出し・警告音1回・最大10分表示) |
+| Indeterminate | 🐣 + 「終わったか確認してね」+ project名 | Stop したが残 Task が in_progress のみ = **status 更新忘れの可能性があり完了とも未完とも断定できない** (薄オレンジ吹き出し・警告音1回・最大10分表示) |
 | Completed | 🐣 + 「終わったよ！」+ project名 | **依頼全体が本当に完了** (白吹き出し・3回ピョコピョコ・通知音1回・約5秒後に次の表示へ) |
+
+Working 中に最近の実 tool activity を観測すると「**● 活動中**」(緑) が添えられる。
+これは進捗率ではなく「Claude が実際に動いている」ことだけを示す
+(進捗%が動かない時間でも stuck ではないと分かる)。最後の activity から15秒で自動消灯。
 
 - 背景完全透過・枠なし・タスクバー/Alt+Tab 非表示・常に最前面
 - **クリック透過**: キャラの背後にある VS Code や Chrome をそのまま操作できる
 - 完全 event-driven。polling なし。アイドル時は `GetMessage` でブロック: **CPU 0% / GPU 0**
 - Electron / WebView / Node 常駐 / localhost サーバー / DB 一切なし
 
-## 実測値 (Windows 11, 2026-08-17, Phase 4.1 時点)
+## 実測値 (Windows 11, 2026-08-17, Phase 4.2 時点)
 
 | 項目 | 実測 |
 |---|---|
@@ -92,16 +97,46 @@ progress bar と「**全体 推定 N%**」を表示する。Task 件数 (3/5 等
    `tool_input` 内の `"status"` 値の件数だけを数えて `completed/in_progress/total` を導出する
    (タスク本文は読まない・送らない)。全量スナップショットなので重複発火しても冪等
 
-### 完了判定 (Phase 4.1)
+### 完了判定 (Phase 4.1 / 4.2)
 
 「終わったよ！」は「**ユーザーが投げた依頼全体が完了した**」ときだけ出す。
 
-- Task を使った依頼: Stop 受信時に未完 Task が残っていれば celebration せず
-  「**途中で止まったよ**」(StoppedIncomplete) を表示する。未完なのに完了と嘘をつかない
+判定フロー (Phase 4.2):
+
+```
+Stop 受信
+  ├─ 未完 Task なし → 終わったよ！
+  └─ 未完 Task あり → Finalizing (約2秒の grace。UI は作業中のまま)
+        ├─ grace 中に完了イベント到着で全完了 → 終わったよ！ (未完表示は一度も出さない)
+        └─ grace 満了
+              ├─ 未着手 (pending) Task が残る → 途中で止まったよ (明確に未完)
+              └─ 残りが in_progress のみ → 終わったか確認してね (断定しない)
+```
+
+- grace window は async hook の到着順ゆれを吸収するための一時 one-shot timer (常時 timer ではない)
+- **Task の削除/キャンセル (`TaskUpdate` status=deleted/cancelled) には対応する hook が発火しない**
+  (実測)。PostToolUse から検知して total から除外する。これを怠ると「完了したのに
+  途中で止まったよ」という false incomplete になる (Phase 4.2 で実際に発生・修正した主因)
 - Task の無い依頼: 構造化された判定材料がないため、Stop を完了として扱う
 - 同一依頼への重複 Stop / 遅延イベントでは celebration は1回だけ (debounce + tombstone)
-- StoppedIncomplete は次の依頼 (UserPromptSubmit) で解除。終了済みセッションが表示を
-  塞ぎ続けないよう最大10分で自動消滅
+- StoppedIncomplete / Indeterminate は次の依頼 (UserPromptSubmit) で解除。終了済み
+  セッションが表示を塞ぎ続けないよう最大10分で自動消滅
+
+### Task source の一貫性
+
+- 新 Task システム (TaskCreate/TaskUpdate) のセッション: TaskCreated/TaskCompleted hook +
+  PostToolUse(TaskUpdate) から task_id 単位で追跡 (in_progress / 削除も反映)。
+  TaskCompleted hook と TaskUpdate(completed) の二重観測は Set で冪等
+- TodoWrite のセッション: 全量スナップショット (completed/in_progress/total) が authoritative
+- 同一依頼内で両方を観測した実例は未確認。両方来た場合は TodoWrite スナップショットを優先
+
+### Task 粒度実験 (Phase 4.2・不採用)
+
+「6〜8個のマイルストーン Task を維持せよ」という指示を付けた A/B 実験の結果:
+進捗は 0→6→12→…→100 (最大7ポイント刻み) と劇的に滑らかになる一方、
+turn 数 5→30、実行時間 +184%、コスト +53% (小タスク比) と負荷が大きく、**不採用**。
+どうしても滑らかな進捗が欲しい長時間依頼では、プロンプトに同様の指示を
+自分で付けることで opt-in できる (グローバル設定は変更していない)。
 
 ### Nested 子 Claude の通知抑制 (Phase 4.1)
 
