@@ -1,4 +1,8 @@
 bin/
+obj/
+*.log
+debug.flag
+test-proj/
 *.suo
 *.user
 Thumbs.db

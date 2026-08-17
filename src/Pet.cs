@@ -105,10 +105,10 @@ namespace ClaudePet
 
         public delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern ushort RegisterClassEx(ref WNDCLASSEX lpwcx);
 
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr CreateWindowEx(int dwExStyle, string lpClassName, string lpWindowName,
             int dwStyle, int x, int y, int nWidth, int nHeight,
             IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
@@ -371,7 +371,9 @@ namespace ClaudePet
             wc.lpfnWndProc = _wndProc;
             wc.hInstance = Native.GetModuleHandle(null);
             wc.lpszClassName = WndClassName;
-            Native.RegisterClassEx(ref wc);
+            ushort atom = Native.RegisterClassEx(ref wc);
+            PetDebug("startup: RegisterClassEx atom=" + atom + " err=" + Marshal.GetLastWin32Error() +
+                " dpi=" + _scale + " work=" + _baseX + "," + _baseY + " win=" + _winW + "x" + _winH);
 
             _hwnd = Native.CreateWindowEx(
                 Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT | Native.WS_EX_TOOLWINDOW |
@@ -380,8 +382,18 @@ namespace ClaudePet
                 _baseX, _baseY, _winW, _winH,
                 IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
 
+            PetDebug("startup: CreateWindowEx hwnd=0x" + _hwnd.ToInt64().ToString("X") +
+                " err=" + Marshal.GetLastWin32Error());
+            if (_hwnd == IntPtr.Zero)
+            {
+                // ウィンドウを作れないまま生き続けると、mutex を握った不可視プロセスが
+                // 以後の自動起動を全て弾いてしまう。即終了して次の自動起動に任せる。
+                return;
+            }
+
             RenderCurrent(true);
             Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
+            PetDebug("startup: shown");
 
             TrimMemory();
 
