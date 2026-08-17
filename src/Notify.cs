@@ -41,6 +41,9 @@ namespace ClaudePetNotify
         private const int EvPermissionPrompt = 3;
         private const int EvActivity = 4;
         private const int EvSessionEnd = 5;
+        private const int EvTaskCreated = 6;    // TaskCreated (Agent Teams系 TaskCreate)
+        private const int EvTaskCompleted = 7;  // TaskCompleted
+        private const int EvTaskSnapshot = 8;   // PostToolUse(TodoWrite) から導出した "done/total"
 
         [StructLayout(LayoutKind.Sequential)]
         private struct COPYDATASTRUCT
@@ -74,6 +77,7 @@ namespace ClaudePetNotify
                 int eventType;
                 string sessionId;
                 string project;
+                string extra = ""; // task_id または "done/total"
 
                 if (args.Length > 0 && args[0] == "--test")
                 {
@@ -86,6 +90,7 @@ namespace ClaudePetNotify
                     int.TryParse(args[1], out eventType);
                     sessionId = args[2];
                     project = args.Length > 3 ? args[3] : "";
+                    extra = args.Length > 4 ? args[4] : "";
                 }
                 else
                 {
@@ -110,6 +115,25 @@ namespace ClaudePetNotify
                             break;
                         case "PostToolUse":
                             eventType = EvActivity;
+                            // TodoWrite (メインセッションのみ) は進捗スナップショットとして送る。
+                            // subagent の todo list は agent_id 付きなので混ぜない。
+                            if (agentId.Length == 0 && ExtractString(json, "tool_name") == "TodoWrite")
+                            {
+                                string counts = CountTodoStatuses(json);
+                                if (counts != null) { eventType = EvTaskSnapshot; extra = counts; }
+                            }
+                            break;
+                        case "TaskCreated":
+                            if (agentId.Length > 0) return 0; // subagent のタスクは数えない
+                            extra = ExtractString(json, "task_id");
+                            if (extra.Length == 0) return 0;  // id が無ければ重複判定不能なので捨てる
+                            eventType = EvTaskCreated;
+                            break;
+                        case "TaskCompleted":
+                            if (agentId.Length > 0) return 0;
+                            extra = ExtractString(json, "task_id");
+                            if (extra.Length == 0) return 0;
+                            eventType = EvTaskCompleted;
                             break;
                         case "SessionEnd":
                             eventType = EvSessionEnd;
@@ -135,8 +159,8 @@ namespace ClaudePetNotify
                     if (hwnd == IntPtr.Zero) { DebugLog(eventType, sessionId, project, "drop:start-fail"); return 0; }
                 }
 
-                bool ok = SendEvent(hwnd, eventType, sessionId + "\n" + project);
-                DebugLog(eventType, sessionId, project, ok ? "sent" : "SEND-FAIL err=" + Marshal.GetLastWin32Error());
+                bool ok = SendEvent(hwnd, eventType, sessionId + "\n" + project + "\n" + extra);
+                DebugLog(eventType, sessionId, project + " extra=" + extra, ok ? "sent" : "SEND-FAIL err=" + Marshal.GetLastWin32Error());
             }
             catch { }
             return 0;
@@ -218,6 +242,25 @@ namespace ClaudePetNotify
                 else sb.Append(c);
             }
             return sb.ToString();
+        }
+
+        // PostToolUse(TodoWrite) の tool_input 内の "status" 値だけを数えて "done/total" を返す。
+        // todo 本文は読まない・送らない。tool_response 以降は数えない (echo による二重カウント防止)。
+        // TodoWrite が空リスト (全消去) のときは "0/0" を返し、Pet 側で進捗表示を消す。
+        private static string CountTodoStatuses(string json)
+        {
+            int start = json.IndexOf("\"tool_input\"", StringComparison.Ordinal);
+            if (start < 0) return null;
+            int end = json.IndexOf("\"tool_response\"", start, StringComparison.Ordinal);
+            string region = (end > start) ? json.Substring(start, end - start) : json.Substring(start);
+
+            int total = 0, done = 0;
+            foreach (Match m in Regex.Matches(region, "\"status\"\\s*:\\s*\"(pending|in_progress|completed)\""))
+            {
+                total++;
+                if (m.Groups[1].Value == "completed") done++;
+            }
+            return done + "/" + total;
         }
 
         private static string ToProjectName(string cwd)

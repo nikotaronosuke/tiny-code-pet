@@ -46,6 +46,8 @@ $events = [ordered]@{
     "Notification"     = "permission_prompt"
     "PostToolUse"      = "*"
     "SessionEnd"       = $null
+    "TaskCreated"      = $null
+    "TaskCompleted"    = $null
 }
 
 $changed = $false

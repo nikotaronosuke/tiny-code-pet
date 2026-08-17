@@ -7,6 +7,7 @@ Claude Code の状態を、デスクトップ右下の小さなひよこを見�
 |---|---|---|
 | Idle | 🐣 + `Claude` | 何もしていない。完全静止 |
 | Working | 🐣 + 「作業中…」+ project名 | 放置してよい (グレーのピル・静止) |
+| Working (Taskあり) | 🐣 + 「作業中…」+ progress bar + 「推定 N%」+ 「done / total」+ project名 | Claude がタスクリストを使って作業中。おおまかな進み具合が分かる |
 | Waiting | 🐣 + 「確認して！」+ project名 | **permission承認待ち。見に行く必要あり** (オレンジ吹き出し・軽く2回ピョコ・警告音1回) |
 | Completed | 🐣 + 「終わったよ！」+ project名 | 完了 (白吹き出し・3回ピョコピョコ・通知音1回・約5秒後に次の表示へ) |
 
@@ -15,16 +16,17 @@ Claude Code の状態を、デスクトップ右下の小さなひよこを見�
 - 完全 event-driven。polling なし。アイドル時は `GetMessage` でブロック: **CPU 0% / GPU 0**
 - Electron / WebView / Node 常駐 / localhost サーバー / DB 一切なし
 
-## 実測値 (Windows 11, 2026-08-17, Phase 3 時点)
+## 実測値 (Windows 11, 2026-08-17, Phase 4 時点)
 
 | 項目 | 実測 |
 |---|---|
-| 待機時 Private Working Set | 約 13.4 MB (起動直後) 〜 14.3 MB (多数の状態遷移後の定常値) |
+| 待機時 Private Working Set | 約 13.5 MB (起動直後) 〜 17.0 MB (多数の進捗描画後の定常値・増加停止確認済み) |
 | 待機時 CPU (60秒計測) | ほぼ 0 ms (イベント無し時は完全 0%) |
 | 待機時 GPU | **0** (GPUエンジンインスタンス自体が0個) |
-| Working / Waiting 表示中 | Idle と同じ (静止ビットマップ、タイマーなし) |
+| Working / Waiting 表示中 | Idle と同じ (静止ビットマップ、タイマーなし)。Task イベント到着時だけ瞬間再描画 |
 | アニメーション1回の CPU 累計 | 約 15〜50 ms |
-| 連続 18 サイクル後のメモリ | 14.31 MB で増加停止 (GDI/USER/ハンドル数は完全に一定) |
+| Hook helper 1回 | 平均約 63 ms で起動〜終了 (async のため Claude を待たせない)。残留プロセスなし |
+| GDI / USER / ハンドル | 5 / 7 / 213 で大量イベント後も完全に一定 (リークなし) |
 
 ## アーキテクチャ
 
@@ -63,6 +65,30 @@ Celebrating
 
 SessionEnd → エントリ削除 (Celebrating中は celebration 終了まで維持)
 ```
+
+### 推定進捗 (Phase 4)
+
+Claude Code がタスクリストを使って作業しているときだけ、Working ピルに
+progress bar と「推定 N%」「done / total」を表示する。
+
+- **「推定」であって精密な実進捗ではない**。「現在 Claude 自身が認識している Task 群」に対する完了割合
+- **ETA ではない**。残り時間の予測は一切しない
+- 計算式: `完了タスク数 ÷ 総タスク数 × 100` (小数切り捨て)
+- **Claude が途中でタスクを追加すると推定進捗が下がる場合がある** (総仕事量の認識が増えたため。バグではない)
+- 100% になっても Stop が来るまでは「作業中…」のまま。Task 完了率と turn 完了は別物
+- **タスクリストを使わない作業では進捗は表示されない**。経過時間やツール実行回数から進捗を捏造することはしない
+
+進捗のデータ源は2系統 (v2.1.233 での実測に基づく):
+
+1. **TodoWrite スナップショット (主経路)**: 通常セッションのタスク管理は TodoWrite ツールで行われる。
+   既存の PostToolUse hook payload の `tool_input` 内の `"status"` 値の件数だけを数えて
+   `done/total` を導出する (タスク本文は読まない・送らない)。全量スナップショットなので重複発火しても冪等
+2. **TaskCreated / TaskCompleted hook (副経路)**: 公式イベントとして存在するが、
+   Agent Teams 系の `TaskCreate` ツール専用で、**TodoWrite では発火しない** (実測確認)。
+   将来のために登録済みで、`task_id` の一意集合 (Set) で管理するため重複通知でも二重加算されない
+
+セッションの Task 状態は celebration 終了時 / SessionEnd 時に session ごと破棄される。
+task_id 集合は 1 セッションあたり最大 256 件で頭打ち。
 
 ### 複数セッション
 
@@ -127,8 +153,10 @@ pwsh -File install-hook.ps1
 | `Stop` | なし | 完了通知 |
 | `UserPromptSubmit` | なし | Working 開始 |
 | `Notification` | `permission_prompt` | 確認して！ (idle_prompt 等は発火させない) |
-| `PostToolUse` | `*` | Waiting 解除 (承認後の作業再開検知) |
+| `PostToolUse` | `*` | Waiting 解除 + TodoWrite 進捗スナップショット |
 | `SessionEnd` | なし | セッション後片付け |
+| `TaskCreated` | なし | Task 進捗 (Agent Teams 系。通常セッションでは発火しない) |
+| `TaskCompleted` | なし | 同上 |
 
 各エントリは `{"type":"command","command":"<path>/ClaudePetNotify.exe","timeout":10,"async":true}`。
 `async: true` + 常時 exit 0 のため **Claude Code を一切ブロック・減速させない**。
@@ -153,9 +181,12 @@ pwsh -File install-hook.ps1
 Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$env:USERPROFILE\.claude\settings.json" -Force
 ```
 
-## 現在の制約 (Phase 3 時点)
+## 現在の制約 (Phase 4 時点)
 
-- 進捗率・ETA は未実装 (Phase 4 予定)
+- ETA (残り時間予測) は未実装 (Phase 5 で検討)
+- 進捗はあくまで推定。Claude がタスクリストを整理し直すと数字が前後する
+- celebration/SessionEnd 直後の遅延イベントは約2分間無視する (幽霊セッション防止)。
+  その間に同一セッションが新しいプロンプトを受ければ正常に復帰する
 - `Stop` は「応答完了」ごとに発火する (短い質問への回答でも「終わったよ！」になる)
 - Waiting の実発火は対話セッションのみ (`claude -p` ヘッドレスでは permission_prompt 通知自体が発生しない)
 - `StopFailure` (エラー状態表示) は未実装
