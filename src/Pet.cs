@@ -3,11 +3,16 @@
 // 描画は System.Drawing で ARGB ビットマップを合成し UpdateLayeredWindow で反映。
 // タイマーはアニメーション中のみ SetTimer し、終了後は必ず KillTimer する。
 //
-// 状態遷移 (session_id 単位):
+// 状態遷移 (Claude: session_id 単位):
 //   (なし) --UserPromptSubmit--> Working --permission_prompt--> Waiting
 //   Waiting --PostToolUse/UserPromptSubmit--> Working
 //   Working/Waiting --Stop--> Celebrating --(バウンド+約5秒)--> (エントリ削除=Idle)
 //   SessionEnd --> エントリ削除
+//
+// Codex は provider+session+turn 単位の別イベント系 (dwData 20〜27) で入ってくる。
+// Claude 側の判定・定数を共通化せず、provider 固有の最小分岐だけを持つ:
+//   Stop は即完了ではなく 5 秒 quiet grace の completion candidate
+//   (Claude の Finalizing 約2秒とは別理由・別定数。docs/DESIGN_DECISIONS.md 参照)
 //
 // 表示は常にペット1匹。優先度 Waiting > Celebrating > Working、同率は最新イベントの session。
 //
@@ -203,6 +208,18 @@ namespace ClaudePet
         public const int TaskSnapshot = 8;      // TodoWrite スナップショット (extra="c/i/t")
         public const int TaskRemoved = 9;       // Task削除/キャンセル (extra=task_id)
         public const int TaskInProgress = 10;   // Task着手 (extra=task_id)
+
+        // --- Codex 専用 (CodexPetNotify.exe)。1〜10 の意味は変更しない ---
+        public const int CodexFirst = 20;
+        public const int CodexPromptSubmit = 20;   // UserPromptSubmit (新 turn)
+        public const int CodexActivity = 21;       // PostToolUse
+        public const int CodexPlanSnapshot = 22;   // PostToolUse(update_plan) (extra="c/i/t")
+        public const int CodexPermission = 23;     // PermissionRequest
+        public const int CodexStop = 24;           // Stop (completion candidate)
+        public const int CodexSessionEnd = 25;     // SessionEnd
+        public const int CodexSubagentStart = 26;  // SubagentStart
+        public const int CodexSubagentStop = 27;   // SubagentStop (root completion にしない)
+        public const int CodexLast = 27;
     }
 
     internal sealed class Session
@@ -233,6 +250,13 @@ namespace ClaudePet
         public int SnapTotal = -1;            // -1 = スナップショット無し
         public int SnapDone;
         public int SnapInProg;
+
+        // --- Codex 専用フィールド (Claude セッションでは常に既定値のまま) ---
+        // Claude の session semantics に turn_id は無いため共通化せず、Codex にだけ持たせる。
+        public bool IsCodex;
+        public string TurnId = "";        // 現在 turn。これ以外の遅延イベントは UI へ反映しない
+        public bool TurnHasSubagent;      // この turn で SubagentStart/Stop を観測した
+        public DateTime CodexGraceDueUtc; // Codex Stop quiet grace の満了時刻 (未設定=MinValue)
 
         public const int MaxTaskIds = 256;
 
@@ -297,12 +321,17 @@ namespace ClaudePet
         private static readonly IntPtr TimerBounce = new IntPtr(1);
         private static readonly IntPtr TimerRevert = new IntPtr(2);
         private static readonly IntPtr TimerActivity = new IntPtr(3); // 「● 活動中」消灯用 one-shot
-        private static readonly IntPtr TimerFinalize = new IntPtr(4); // Stop後grace用 one-shot
+        private static readonly IntPtr TimerFinalize = new IntPtr(4); // Claude: Stop後grace用 one-shot
+        private static readonly IntPtr TimerCodexGrace = new IntPtr(5); // Codex: Stop quiet grace用 one-shot
 
         private const int BounceIntervalMs = 30;
         private const int RevertDelayMs = 3700;        // 完了バウンド後のメッセージ表示継続時間
         private const int RevertDelayHiddenMs = 5000;  // 非表示セッションの完了エントリ掃除
-        private const int FinalizeGraceMs = 2000;      // Stop後、遅延完了イベントを待つ時間
+        private const int FinalizeGraceMs = 2000;      // Claude: Stop後、遅延完了イベントを待つ時間
+        // Codex: Stop は完了確定ではない。実測で最初の Stop が約1.88秒後に別 hook から
+        // continuation され、同一 turn の 2 回目 Stop が来るケースがあるため、
+        // Stop を completion candidate とし静穏 5 秒で確定する (Claude の 2 秒とは別物)。
+        private const int CodexQuietGraceMs = 5000;
         private static readonly TimeSpan ActivityTtl = TimeSpan.FromSeconds(15); // 「● 活動中」の表示保持
 
         private const int MaxSessions = 8;             // 通常同時利用は数セッション。無制限に増やさない
@@ -431,6 +460,7 @@ namespace ClaudePet
                     else if (wParam == TimerRevert) OnRevert();
                     else if (wParam == TimerActivity) OnActivityExpire();
                     else if (wParam == TimerFinalize) OnFinalizeTick();
+                    else if (wParam == TimerCodexGrace) OnCodexGraceTick();
                     return IntPtr.Zero;
 
                 case Native.WM_CLOSE:
@@ -455,22 +485,29 @@ namespace ClaudePet
                 var cds = (Native.COPYDATASTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.COPYDATASTRUCT));
                 int eventType = (int)cds.dwData.ToInt64();
 
+                // Claude (1〜10) は従来どおり3フィールド。Codex (20〜27) だけ
+                // 4フィールド目に turn_id を持つ。既存 payload 契約は変更しない。
+                bool isCodex = (eventType >= PetEvent.CodexFirst && eventType <= PetEvent.CodexLast);
+
                 string sessionId = "";
                 string project = "";
                 string extra = "";
+                string turnId = "";
                 if (cds.cbData > 0 && cds.lpData != IntPtr.Zero)
                 {
                     byte[] buf = new byte[cds.cbData];
                     Marshal.Copy(cds.lpData, buf, 0, cds.cbData);
                     string payload = System.Text.Encoding.UTF8.GetString(buf).TrimEnd('\0');
-                    string[] parts = payload.Split(new char[] { '\n' }, 3);
+                    string[] parts = payload.Split(new char[] { '\n' }, isCodex ? 4 : 3);
                     if (parts.Length >= 2) { sessionId = parts[0]; project = parts[1]; }
                     else project = payload;
                     if (parts.Length >= 3) extra = parts[2];
+                    if (isCodex && parts.Length >= 4) turnId = parts[3];
                 }
                 if (sessionId.Length == 0) sessionId = "(default)";
 
-                OnEvent(eventType, sessionId, project, extra);
+                if (isCodex) OnCodexEvent(eventType, sessionId, project, extra, turnId);
+                else OnEvent(eventType, sessionId, project, extra);
                 PetDebug("recv ev=" + eventType + " sess=" + sessionId + " -> shown=" + _shownKey);
             }
             catch (Exception ex) { PetDebug("recv-error " + ex.GetType().Name + " " + ex.Message); }
@@ -584,6 +621,13 @@ namespace ClaudePet
             }
             if (s != null) Touch(s, project);
 
+            AfterEvent(sessionId, becameCelebrating, becameWaiting);
+        }
+
+        // イベント処理後の共通後処理 (prune / 音 / 再描画 / アニメ)。
+        // Claude・Codex どちらの handler からも同じ意味で呼ぶ。
+        private void AfterEvent(string sessionKey, bool becameCelebrating, bool becameWaiting)
+        {
             Prune();
 
             // 音は表示中かどうかに関わらず状態遷移時のみ1回
@@ -593,7 +637,7 @@ namespace ClaudePet
             string displayId = ComputeDisplaySession();
             RenderCurrent(false);
 
-            bool displayed = (displayId == sessionId);
+            bool displayed = (displayId == sessionKey);
             if (becameCelebrating)
             {
                 if (displayed) StartBounce(AnimCelebrate);
@@ -603,6 +647,152 @@ namespace ClaudePet
             {
                 StartBounce(AnimLight);
             }
+        }
+
+        // ---- Codex イベント処理 (provider + session + turn) ------------------
+        //
+        // Claude 側 (OnEvent) とは意図的に分離している。Codex の Stop は完了確定では
+        // なく、interrupt では Stop 自体が来ない (Phase F 実測)。Claude の完了判定を
+        // Codex 仕様へ共通化しないことで、Claude の挙動を一切変えずに済ませている。
+        private void OnCodexEvent(int eventType, string sessionId, string project, string extra, string turnId)
+        {
+            _seq++;
+            string key = CodexKey(sessionId);
+            Session s;
+            _sessions.TryGetValue(key, out s);
+
+            bool becameWaiting = false;
+
+            switch (eventType)
+            {
+                case PetEvent.CodexPromptSubmit:
+                    // 新 turn。interrupt 後に残っていた古い progress / permission /
+                    // activity / Stop candidate をここで全て破棄する。
+                    _recentlyEnded.Remove(key);
+                    s = Upsert(key, s, project, true);
+                    s.IsCodex = true;
+                    s.State = Session.Working;
+                    s.ResetRequest();
+                    s.TurnId = turnId;
+                    s.TurnHasSubagent = false;
+                    s.CodexGraceDueUtc = DateTime.MinValue;
+                    s.LastActivityUtc = DateTime.MinValue;
+                    break;
+
+                case PetEvent.CodexActivity:
+                case PetEvent.CodexPlanSnapshot:
+                    if (turnId.Length == 0) return; // turn 不明は fail-closed
+                    // 終了系表示中の残イベントでは状態を戻さない
+                    if (s != null && IsTerminal(s.State)) { Touch(s, project); break; }
+                    if (s == null && IsTombstoned(key)) return;
+                    if (s != null && !TurnMatches(s, turnId)) return; // 旧 turn の遅延イベント
+                    // PostToolUse の cwd は揺れうるため project 名は上書きしない
+                    s = Upsert(key, s, project, false);
+                    s.IsCodex = true;
+                    if (s.TurnId.Length == 0) s.TurnId = turnId; // 初観測 turn を採用
+                    s.LastActivityUtc = DateTime.UtcNow;
+                    // work activity が来た = まだ終わっていない。completion candidate を破棄する
+                    s.CodexGraceDueUtc = DateTime.MinValue;
+                    s.State = Session.Working;
+                    // subagent を含む turn では update_plan の origin を証明できないため
+                    // root progress へ適用しない (SubagentStop 後もその turn 中は再開しない)
+                    if (eventType == PetEvent.CodexPlanSnapshot && !s.TurnHasSubagent)
+                        ApplyTaskEvent(s, PetEvent.TaskSnapshot, extra);
+                    break;
+
+                case PetEvent.CodexPermission:
+                    if (turnId.Length == 0) return;
+                    _recentlyEnded.Remove(key);
+                    if (s != null && !TurnMatches(s, turnId)) return;
+                    bool wasWaiting = (s != null && s.State == Session.Waiting);
+                    s = Upsert(key, s, project, true);
+                    s.IsCodex = true;
+                    if (s.TurnId.Length == 0) s.TurnId = turnId;
+                    s.State = Session.Waiting;
+                    s.CodexGraceDueUtc = DateTime.MinValue;
+                    becameWaiting = !wasWaiting; // debounce
+                    break;
+
+                case PetEvent.CodexStop:
+                    if (turnId.Length == 0) return;
+                    if (s == null && IsTombstoned(key)) return;
+                    if (s != null && !TurnMatches(s, turnId)) return;
+                    if (s != null && IsTerminal(s.State)) { Touch(s, project); break; }
+                    s = Upsert(key, s, project, true);
+                    s.IsCodex = true;
+                    if (s.TurnId.Length == 0) s.TurnId = turnId;
+                    // Stop = completion candidate。UI は Working のまま静穏 5 秒待つ。
+                    // 同一 turn の 2 回目 Stop なら 5 秒を最初から数え直す。
+                    s.State = Session.Finalizing;
+                    s.CodexGraceDueUtc = DateTime.UtcNow.AddMilliseconds(CodexQuietGraceMs);
+                    break;
+
+                case PetEvent.CodexSubagentStart:
+                case PetEvent.CodexSubagentStop:
+                    // PreToolUse/PostToolUse schema には agent_id が無く、tool event の
+                    // origin を structured metadata だけで証明できない。fail-closed で、
+                    // この turn は root progress を信用しない (SubagentStop も完了にしない)。
+                    if (turnId.Length == 0) return;
+                    if (s == null) return;                 // subagent だけで session を作らない
+                    if (!TurnMatches(s, turnId)) return;
+                    if (IsTerminal(s.State)) { Touch(s, project); break; }
+                    s.TurnHasSubagent = true;
+                    s.SnapTotal = -1; s.SnapDone = 0; s.SnapInProg = 0; // 表示済み progress も無効化
+                    s.LastActivityUtc = DateTime.UtcNow;
+                    break;
+
+                case PetEvent.CodexSessionEnd:
+                    // Celebrating / Finalizing 中は消さない (通知そのものが消えるため)。
+                    // 削除により permission (Waiting) 状態も解除される。
+                    if (s != null && s.State != Session.Celebrating && s.State != Session.Finalizing)
+                    {
+                        _sessions.Remove(key);
+                        AddTombstone(key);
+                        s = null;
+                    }
+                    break;
+
+                default:
+                    return;
+            }
+            if (s != null) Touch(s, project);
+
+            ArmCodexGraceTimer();
+            AfterEvent(key, false, becameWaiting); // Codex は Stop 直後に Celebrating しない
+        }
+
+        // provider 名前空間の分離。Claude の session_id と衝突しない内部 key。
+        private static string CodexKey(string sessionId) { return "codex:" + sessionId; }
+
+        private static bool TurnMatches(Session s, string turnId)
+        {
+            return s.TurnId.Length == 0 || s.TurnId == turnId;
+        }
+
+        private static bool IsTerminal(int state)
+        {
+            return state == Session.Celebrating ||
+                   state == Session.StoppedIncomplete ||
+                   state == Session.Indeterminate;
+        }
+
+        // Codex の quiet grace は session ごとに満了時刻を持ち、timer は最短期限へ
+        // 1 本だけ張る (常時 timer / polling を増やさない)。
+        private void ArmCodexGraceTimer()
+        {
+            DateTime next = DateTime.MaxValue;
+            foreach (var kv in _sessions)
+            {
+                Session s = kv.Value;
+                if (!s.IsCodex || s.State != Session.Finalizing) continue;
+                if (s.CodexGraceDueUtc == DateTime.MinValue) continue;
+                if (s.CodexGraceDueUtc < next) next = s.CodexGraceDueUtc;
+            }
+            Native.KillTimer(_hwnd, TimerCodexGrace);
+            if (next == DateTime.MaxValue) return;
+            double ms = (next - DateTime.UtcNow).TotalMilliseconds;
+            if (ms < 30) ms = 30;
+            Native.SetTimer(_hwnd, TimerCodexGrace, (uint)ms, IntPtr.Zero);
         }
 
         private void AddTombstone(string sessionId)
@@ -845,13 +1035,36 @@ namespace ClaudePet
         private void OnFinalizeTick()
         {
             Native.KillTimer(_hwnd, TimerFinalize);
+            FinalizeDue(false);
+        }
+
+        // Codex quiet grace 満了: 期限の来た Codex セッションだけ確定し、
+        // 残りがあれば最短期限へ timer を張り直す (one-shot のまま)。
+        private void OnCodexGraceTick()
+        {
+            Native.KillTimer(_hwnd, TimerCodexGrace);
+            FinalizeDue(true);
+            ArmCodexGraceTimer();
+        }
+
+        // Finalizing の確定処理。codex=false なら Claude の 2 秒 grace 満了、
+        // codex=true なら Codex の 5 秒 quiet grace 満了分のみを対象にする。
+        // 判定基準 (完了 / 未着手あり / in_progress のみ) は既存の完了哲学と同じ。
+        private void FinalizeDue(bool codex)
+        {
             bool celebrated = false;
             bool alerted = false;
             string celebratedId = null;
+            DateTime now = DateTime.UtcNow;
             foreach (var kv in _sessions)
             {
                 Session s = kv.Value;
                 if (s.State != Session.Finalizing) continue;
+                if (s.IsCodex != codex) continue;
+                // Codex は session ごとに満了時刻を持つ (再 Stop で伸びる)。
+                // 期限未設定 = candidate 無し。推測 timeout で確定させない。
+                if (codex && s.CodexGraceDueUtc == DateTime.MinValue) continue;
+                if (codex && s.CodexGraceDueUtc > now.AddMilliseconds(50)) continue;
                 int done, inProg, total;
                 s.GetProgress(out done, out inProg, out total);
                 if (total <= 0 || done >= total)
@@ -873,11 +1086,12 @@ namespace ClaudePet
                     s.State = Session.Indeterminate;
                     alerted = true;
                 }
+                s.CodexGraceDueUtc = DateTime.MinValue;
                 _seq++;
                 s.LastSeq = _seq;
                 s.LastAtUtc = DateTime.UtcNow;
-                PetDebug("finalize sess=" + kv.Key + " -> state=" + s.State +
-                    " (" + done + "+" + inProg + "ip/" + total + ")");
+                PetDebug("finalize" + (codex ? ":codex" : "") + " sess=" + kv.Key +
+                    " -> state=" + s.State + " (" + done + "+" + inProg + "ip/" + total + ")");
             }
 
             if (celebrated) Native.MessageBeep(Native.SOUND_DEFAULT);

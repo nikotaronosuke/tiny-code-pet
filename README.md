@@ -1,9 +1,10 @@
 # Claude Desktop Pet 🐣
 
-A tiny native Windows desktop pet that shows what Claude Code is doing — working, waiting for you, overall progress, and truthful completion — at a glance.
+A tiny native Windows desktop pet that shows what Claude Code (and Codex) is doing — working, waiting for you, overall progress, and truthful completion — at a glance.
 
-Claude Code の状態を、デスクトップ右下の小さなひよこを見るだけで把握できる
-**超軽量デスクトップ通知キャラクター** です。
+Claude Code / Codex の状態を、デスクトップ右下の小さなひよこを見るだけで
+把握できる **超軽量デスクトップ通知キャラクター** です。
+Claude Code と Codex を同時に使っても session / 状態は衝突しません。
 
 | 状態 | 表示 | 意味 |
 |---|---|---|
@@ -30,6 +31,7 @@ Working 中に最近の実 tool activity を観測すると「**● 活動中**�
 - 複数セッションの同時追跡 (優先度付き表示)
 - 別の Claude セッションのツール内から起動された子 Claude (`claude -p` 等) の通知抑制
 - Subagent 完了の誤通知防止
+- **Codex 対応** (別 adapter / provider + session + turn で状態分離)
 
 ## 軽さ (参考実測値)
 
@@ -60,6 +62,22 @@ ClaudePetNotify.exe   … Hook Adapter。正規化イベントへ変換して即
 ClaudePet.exe         … 常駐ペット。session_id 単位の状態機械 (依頼=Request 単位で進捗管理)
         ▼
 Win32 layered window  … UpdateLayeredWindow で ARGB 描画 (状態変化時のみ)
+```
+
+Codex は別の adapter を通る (Claude 側の契約は一切変えていない):
+
+```
+Codex Hooks (hooks.json)
+  UserPromptSubmit ── PostToolUse(.*) ── PermissionRequest(.*)
+  Stop ── SessionEnd ── SubagentStart ── SubagentStop
+        │  stdin の JSON から status metadata のみ読む
+        │  (hook_event_name / session_id / turn_id / cwd / tool_name / plan[].status)
+        ▼
+CodexPetNotify.exe    … Codex Hook Adapter。dwData 20〜27 へ変換して即終了
+        │  WM_COPYDATA: dwData=20〜27、payload は 4 行
+        │  (session_id / project名 / extra / turn_id を改行区切り)
+        ▼
+ClaudePet.exe         … 同じ常駐ペット。provider + session + turn で状態を分ける
 ```
 
 - 実装: C# (P/Invoke による純 Win32)。**.NET Framework 4.8 同梱の csc.exe でビルドするため追加インストール不要**
@@ -149,14 +167,93 @@ project-a が解消 (承認して作業再開 or 完了) すると「作業中�
 - 防御として、`Stop` payload に `agent_id` が含まれる場合も通知しない
 - `claude -p` 等で明示起動した別プロセスの Claude は独立セッションとして正当に監視される
 
+## Codex 対応
+
+Claude Code と同じペット・同じ UI で Codex の状態も見られる。
+Codex 専用の画面は追加していない (Working / 進捗 / 確認して！/
+終わったよ！/ 途中で止まったよ をそのまま使う)。
+
+### Setup
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1
+pwsh -File install-codex-hook.ps1 -DryRun   # まず差分を確認
+pwsh -File install-codex-hook.ps1           # 実際に追記
+```
+
+1. `install-codex-hook.ps1` は `$CODEX_HOME\hooks.json`
+   (既定は `%USERPROFILE%\.codex\hooks.json`) へ hook を **追記** する。
+   既存 hook は一切変更しない。イベント単位で冪等。実行前に自動バックアップ。
+   `-ProjectPath <dir>` で project 単位 (`<dir>\.codex\hooks.json`) へも入れられる。
+2. **`config.toml` はこのスクリプトが書き換えない。**
+   `[features] hooks = true` が無ければ必要な 2 行を案内するので自分で追記する。
+3. Codex は次回起動時に hooks.json の内容確認 (trust) を求めるので承認する。
+   `--dangerously-bypass-hook-trust` は使わない。
+4. hook は新しい Codex セッションから有効。
+
+登録される hook:
+
+| イベント | matcher | async | 用途 |
+|---|---|---|---|
+| `UserPromptSubmit` | なし | sync | 新 turn 登録 / 依頼リセット |
+| `PostToolUse` | `.*` | async | activity 表示・`update_plan` 進捗 |
+| `PermissionRequest` | `.*` | sync | 確認して！ |
+| `Stop` | なし | sync | 完了候補 (5 秒 grace 開始) |
+| `SessionEnd` | なし | sync | 後片付け |
+| `SubagentStart` / `SubagentStop` | なし | sync | subagent 検知 (完了にはしない) |
+
+`PreToolUse` は登録しない (PostToolUse で十分)。
+`PostToolUse` は 1 本だけ登録し、activity と `update_plan` 進捗を同じ helper で処理する
+(1 tool あたり helper は 1 回だけ起動する)。
+async はあくまで性能最適化であり、sync になっても正しさは壊れない。
+
+### Codex の進捗
+
+- **`update_plan` を使っているときだけ** 進捗を表示する。
+  `tool_input.plan` は全量 snapshot なので status の件数だけを数える
+  (plan の step 本文は読まない)。
+- plan がない依頼では **% を捧造しない** (進捗非表示)。
+  snapshot を取れなかった hook も同じで、推測で埋めず次の snapshot で自己修復する。
+- 計算式は Claude と同じ `(completed + 0.5 × in_progress) ÷ total`。
+
+### Codex の完了判定
+
+- **Codex の `Stop` は完了確定ではない。** 別の hook が continuation を返すと
+  同じ turn のまま作業が続き、もう一度 `Stop` が来る (実測)。
+  よって `Stop` は「完了候補」として扱い、**静穏 5 秒**で確定する。
+  grace 中に同じ turn の作業イベントが来たら候補を破棄し、
+  2 回目の `Stop` なら 5 秒を最初から数え直す。
+  (Claude 側の約 2 秒 Finalizing とは別理由・別定数。互いに影響しない)
+- **interrupt (途中停止) では完了通知を出さない。**
+  interrupt では `Stop` も `SessionEnd` も発火しない (実測) ので、
+  完了候補自体が作られず「終わったよ！」の誤通知は構造的に起きない。
+  代わりに「作業中…」表示が残る。推測 timeout で完了扱いにはしない。
+  次の依頼 (UserPromptSubmit) で新 turn としてリセットされる。
+- interrupt 後に古い `PostToolUse` が **約 18.6 秒遅れて** 届いた実測があるため、
+  内部状態は provider + session + **turn** で分けている。
+  現在 turn 以外の遅延イベントは UI へ反映しない。
+
+### Known limitation: subagent
+
+- `SubagentStart` / `SubagentStop` は公式 schema にはあるが、
+  **検証環境で実発火を確認できていない** (現 build で発火しない可能性がある)。
+- `PreToolUse` / `PostToolUse` の schema には `agent_id` が無く、
+  tool event が root のものか subagent のものかを metadata だけで証明できない。
+- よって fail-closed: `SubagentStart` を検知した turn では
+  **その turn の進捗を信用せず % を表示しない** (表示中のものも消す)。
+  `SubagentStop` を root の完了にはしない。tool activity 表示には使う。
+- subagent の進捗のためだけに rollout watcher / App Server 常駐は導入しない。
+
 ## Privacy / Security
 
 このツールが扱うのは status metadata のみ:
 
-- Hook の stdin JSON から読むのは `hook_event_name` / `session_id` / `cwd` / `agent_id` /
-  `tool_name` / task の status・id のみ
-- **Prompt 本文・Claude の応答本文・ソースコード本文・API キー・secret を
-  進捗判定のために収集しない**。タスクの本文 (subject/description) も読まない
+- Hook の stdin JSON から読むのは `hook_event_name` / `session_id` / `turn_id` / `cwd` /
+  `agent_id` / `agent_type` / `tool_name` / `permission_mode` / `stop_hook_active` /
+  task ・ plan の status・id のみ
+- **Prompt 本文・Claude / Codex の応答本文・ソースコード本文・API キー・secret を
+  進捗判定のために収集しない**。タスク本文 (subject/description)、
+  Codex の plan step 本文、tool command / response 本文、transcript も読まない
 - 保存も送信もしない (ネットワーク通信なし・履歴 DB なし・全て in-memory)
 
 ## Requirements
@@ -164,6 +261,8 @@ project-a が解消 (承認して作業再開 or 完了) すると「作業中�
 - Windows 10 / 11 (x64)
 - .NET Framework 4.8 (Windows 10/11 に標準搭載。追加インストール不要)
 - [Claude Code](https://claude.com/claude-code) (Hooks 対応バージョン。v2.1.233 で開発・検証)
+- (任意) Codex — Hooks 対応バージョン。VS Code 拡張 26.814.41407 /
+  Codex CLI 0.148.0-alpha.15 で仕様を実測して実装
 
 ## Build
 
@@ -173,7 +272,8 @@ cd claude-desktop-pet
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-`bin\ClaudePet.exe` (常駐本体) と `bin\ClaudePetNotify.exe` (Hookヘルパー) が生成される。
+`bin\ClaudePet.exe` (常駐本体)、`bin\ClaudePetNotify.exe` (Claude Hook ヘルパー)、
+`bin\CodexPetNotify.exe` (Codex Hook ヘルパー) が生成される。
 コンパイルには Windows 標準の `csc.exe` (.NET Framework 4.8 同梱) を使うため、
 Visual Studio や .NET SDK は不要。
 
@@ -183,6 +283,9 @@ Visual Studio や .NET SDK は不要。
 pwsh -File install-hook.ps1   # または powershell -File install-hook.ps1
 .\bin\ClaudePet.exe           # 常駐開始 (Hook発火時に自動起動もされる)
 ```
+
+Codex 側の導入は「Codex 対応 › Setup」を参照 (`install-codex-hook.ps1`)。
+Claude 側と Codex 側は独立していて、片方だけ入れても動く。
 
 `install-hook.ps1` はユーザーレベル設定 `%USERPROFILE%\.claude\settings.json` に
 以下の hook を **追記** する (既存 hooks は一切変更しない。イベント単位で冪等。
@@ -221,6 +324,8 @@ pwsh -File install-hook.ps1   # または powershell -File install-hook.ps1
 
 1. Hook を外す: `pwsh -File uninstall-hook.ps1`
    (`ClaudePetNotify` を含む hook だけを全イベントから削除。他の設定は無傷。自動バックアップあり)
+   Codex を入れていた場合は `pwsh -File uninstall-codex-hook.ps1`
+   (`CodexPetNotify` を含む hook だけを削除。`-DryRun` で事前確認可。config.toml は無傷)
 2. 常駐を止める: `.\bin\ClaudePetNotify.exe --quit`
 3. クローンしたフォルダを削除
 
@@ -243,6 +348,11 @@ Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$e
 - マルチモニタ: プライマリモニタの右下固定。モニタ構成変更後はペット再起動が必要
 - DPI はシステム DPI 基準 (セッション中の DPI 変更には追従しない)
 - キャラはコード描画のひよこ (`src/Pet.cs` の `PetRenderer` 差し替えで変更可能)
+- Codex: `SubagentStart` / `SubagentStop` の実発火未確認。subagent を含む turn では
+  進捗を表示しない (上記 Known limitation)
+- Codex: interrupt では `Stop` が来ないため「作業中…」が残る
+  (誤った完了通知を出さないための意図的な振る舞い)
+- Codex 側に nested 抑制 (Claude の process ancestor chain 相当) はない
 
 ### Technical note: Task 粒度と進捗の滑らかさ
 

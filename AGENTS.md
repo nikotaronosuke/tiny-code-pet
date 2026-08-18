@@ -58,16 +58,30 @@ metadata から妥当な進捗材料が取れる場合のみ % を表示する�
   現在の約 2 秒 (`FinalizeGraceMs`) を理由なく変更しない。
 - false positive な「終わったよ！」を避けることを最優先する。
 
-## Claude Code compatibility
+## Claude Code / Codex compatibility
 
-今後 Codex 対応を追加しても:
+Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節が根拠)。
+以下は壊さないこと:
 
-- Claude Code 対応を壊さない。
-- 既存 hook イベント (正規化イベント 1〜10) の意味を変更しない。
-- Claude 側の完了判定・進捗判定を勝手に共通化して挙動変更しない。
-- provider 固有入力は adapter 層 (hook helper) で正規化し、pet 本体へ
-  共通イベントとして渡す方向を優先する (docs/DESIGN_DECISIONS.md 参照)。
-- Claude と Codex を同時使用しても session / state が衝突しない設計を検討する。
+- Claude 側:
+  - `src/Notify.cs` (Claude adapter) と正規化イベント 1〜10 の意味を変更しない。
+  - Claude payload は 3 行のまま (4 行目の turn_id は Codex 専用)。
+  - `FinalizeGraceMs = 2000` (Claude の Finalizing) を理由なく変えない。
+  - Claude の完了判定を Codex 仕様へ共通化しない。
+- Codex 側 (`src/CodexNotify.cs` + `Pet.cs` の `OnCodexEvent`):
+  - dwData 20〜27 が Codex 専用範囲。1〜10 へ混ぜない。
+  - 内部 key は `codex:<session_id>`。状態は provider + session + **turn** で分ける。
+    current turn 以外の遅延イベントを UI へ反映させない (実測 18.6 秒遅延あり)。
+  - Codex の `Stop` は完了確定ではない。`CodexQuietGraceMs = 5000` の
+    quiet grace を削らない・短縮しない・Claude の 2 秒と共通化しない。
+  - interrupt では `Stop` が来ない。**推測 timeout で Completed / Indeterminate へ移さない。**
+  - `update_plan` の status 件数だけを数える。snapshot を取れなければ進捗を出さない。
+  - subagent を検知した turn では progress を信用しない (fail-closed)。
+  - rollout watcher / App Server 常駐 / PreToolUse hook を導入しない。
+  - ペット自動起動は `UseShellExecute = true`。false へ戻すと hook の stdout を
+    ペットが掘んだままになり、sync hook がブロックする。
+  - `install-codex-hook.ps1` は `config.toml` を書き換えない。
+    `--dangerously-bypass-hook-trust` を production 設定へ入れない。
 
 ## Before changing behavior
 

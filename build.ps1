@@ -15,4 +15,7 @@ if ($LASTEXITCODE -ne 0) { throw "build failed: ClaudePet.exe" }
 & $csc @common "/out:$root\bin\ClaudePetNotify.exe" "$root\src\Notify.cs"
 if ($LASTEXITCODE -ne 0) { throw "build failed: ClaudePetNotify.exe" }
 
-Write-Host "OK: bin\ClaudePet.exe, bin\ClaudePetNotify.exe"
+& $csc @common "/out:$root\bin\CodexPetNotify.exe" "$root\src\CodexNotify.cs"
+if ($LASTEXITCODE -ne 0) { throw "build failed: CodexPetNotify.exe" }
+
+Write-Host "OK: bin\ClaudePet.exe, bin\ClaudePetNotify.exe, bin\CodexPetNotify.exe"
