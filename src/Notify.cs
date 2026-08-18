@@ -47,6 +47,12 @@ namespace ClaudePetNotify
         private const int EvTaskRemoved = 9;    // TaskUpdate(deleted/cancelled)。削除はhookが発火しない (実測)
         private const int EvTaskInProgress = 10; // TaskUpdate(in_progress) (extra=task_id)
 
+        // structured tracker (TodoWrite / Task 系) を観測したが status を解析できなかったとき、
+        // Activity(4) の extra に載せる固定 marker。本文は一切含まない。
+        // 「今回 status を読めなかった」を「tracker を使っていない」へ格下げさせないための印。
+        // src/Pet.cs / src/CodexNotify.cs の同名定数と文字列を一致させること。
+        private const string StructuredObserved = "structured-observed";
+
         [StructLayout(LayoutKind.Sequential)]
         private struct COPYDATASTRUCT
         {
@@ -243,6 +249,7 @@ namespace ClaudePetNotify
                                     // subagent の todo list は agent_id 付きなので混ぜない。
                                     string counts = CountTodoStatuses(json);
                                     if (counts != null) { eventType = EvTaskSnapshot; extra = counts; }
+                                    else extra = StructuredObserved; // 解析失敗でも tracker 使用の事実は残す
                                 }
                                 else if (toolName == "TaskUpdate")
                                 {
@@ -260,19 +267,24 @@ namespace ClaudePetNotify
                                         else if (status == "completed")
                                         { eventType = EvTaskCompleted; extra = tid; }
                                     }
+                                    // id も status も拾えなかった TaskUpdate は空 Activity にせず
+                                    // tracker 観測として残す
+                                    if (eventType == EvActivity) extra = StructuredObserved;
                                 }
                             }
                             break;
                         case "TaskCreated":
                             if (agentId.Length > 0) return 0; // subagent のタスクは数えない
                             extra = ExtractString(json, "task_id");
-                            if (extra.Length == 0) return 0;  // id が無ければ重複判定不能なので捨てる
+                            // id が無いと重複判定できないので進捗には数えないが、
+                            // tracker を使った事実だけは落とさない
+                            if (extra.Length == 0) { eventType = EvActivity; extra = StructuredObserved; break; }
                             eventType = EvTaskCreated;
                             break;
                         case "TaskCompleted":
                             if (agentId.Length > 0) return 0;
                             extra = ExtractString(json, "task_id");
-                            if (extra.Length == 0) return 0;
+                            if (extra.Length == 0) { eventType = EvActivity; extra = StructuredObserved; break; }
                             eventType = EvTaskCompleted;
                             break;
                         case "SessionEnd":

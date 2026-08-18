@@ -99,10 +99,11 @@ PostToolUse(TodoWrite) の status 件数スナップショット。同一依頼�
   (ev=9) / in_progress (ev=10) / completed 保険 (ev=7) を導出して解決。
 - TaskCompleted hook と TaskUpdate(completed) は二重発火する。
   task_id の Set 管理による冪等性が前提。
-- async hook の到着順ゆれ対策として、Stop 時に未完 Task が残っていても
-  即断定せず **Finalizing (約 2 秒 grace、`FinalizeGraceMs = 2000`)**。
-  UI は Working のまま。grace 中に完了イベントが届けば通常の
-  Celebrating (未完表示は一度も見せない)。
+- async hook の到着順ゆれ対策として **Finalizing
+  (約 2 秒 quiet grace、`FinalizeGraceMs = 2000`)**。UI は Working のまま。
+  当初は「未完 Task が残っているときだけ」grace へ入っていたが、
+  現在は **すべての root Stop** が grace を通る (後述「Claude の
+  quiet grace」節)。
 - grace 満了時の判定:
   - pending (未着手) が残る → **StoppedIncomplete**「途中で止まったよ」
   - 残りが in_progress のみ → **Indeterminate**「終わったか確認してね」
@@ -114,6 +115,117 @@ PostToolUse(TodoWrite) の status 件数スナップショット。同一依頼�
   セッション再作成を防止 (UserPromptSubmit / permission_prompt で解除)。
   SessionEnd は Celebrating / Finalizing 中のエントリを削除しない
   (削除すると完了・未完通知そのものが消えるため)。
+
+
+## structured tracker の「観測事実」と「現在の snapshot」を分ける
+
+false positive な「終わったよ！」をさらに潰すための変更。
+
+### なぜ分けるか
+
+adapter は status を解析できないと event を通常 Activity へ落とす。
+このとき Pet 側は「structured task を使っていない依頼」と見なし、
+Stop だけで完了扱いしてしまう経路があった。
+
+**「今回 status を読めなかった」≠「structured tracker は使われていない」** 。
+同じ考え方は関連 OSS でも使われている (claude-hud は transcript から
+Todo を復元できなくても過去の structured state を「存在しない」へ落とさない、
+codex-pulse は新しい解析で plan を取れなくても plan の存在を忘れない)。
+
+### 固定 marker `structured-observed`
+
+新しい event ID は追加せず、既存 Activity (4 / 21) の `extra` に
+**固定文字列 `structured-observed`** だけを載せる。
+payload の行数契約 (Claude 3 行 / Codex 4 行) も event 1〜10 / 20〜27 の
+意味も変えていない。marker は prompt / Todo 本文 / plan step / command /
+response を一切含まない。3 つの source の同名定数を一致させること。
+
+marker を出すのは:
+
+- Claude: PostToolUse(TodoWrite) の snapshot 解析失敗、
+  PostToolUse(TaskUpdate) を 7/9/10 へ変換できないとき、
+  TaskCreated / TaskCompleted で task_id を取れないとき (以前は捨てていた)
+- Codex: PostToolUse(update_plan) の plan 解析失敗
+
+subagent (agent_id 付き) の structured task を root へ混ぜない点、
+nested Claude suppression は従来どおり。
+
+### `SawStructuredTasks` の意味
+
+「現在 valid な snapshot があるか」ではなく
+**「この依頼/turn で structured tracker を一度でも観測したか」**。
+marker でも、正常な snapshot でも true になり、**`ResetRequest()`
+(新しい UserPromptSubmit / CodexPromptSubmit) 以外では false へ戻さない**。
+
+- snapshot の件数は問わない。`total=0` (リスト全消し) でも
+  「tracker なし依頼」へは格下げしない (安易に complete としない)。
+- marker 受信時に snapshot 値は一切触らない。既存の有効な snapshot を
+  消さないし、進捗率も捧造しない。tracker の存在だけを sticky にする。
+- Codex では subagent 拑制中の update_plan でも観測事実は残す
+  (progress へは適用しないまま)。
+
+## Claude の quiet grace (root Stop は常に 2 秒)
+
+### 常に grace へ入る
+
+以前は「Stop 時点で全 completed / task なしなら即 Celebrating」だったが、
+Claude の hook は async なので
+
+```
+TaskCompleted(A)   <- 実際には Stop より前に発生
+Stop
+TaskCreated(B)     <- だが Stop より後に届く
+```
+
+という順で届きうる。A だけを見て完了とするのは false positive。
+OpenAI Codex の Hooks source でも async hook は本当に非同期に schedule され、
+Anthropic 側でも実処理完了と Task/Todo lifecycle state のずれが報告されている。
+
+よって **root Claude の Stop は、structured task を観測済みかどうかに関係なく
+必ず Finalizing へ入る**。task を一切使わない短い依頼でも通知が約 2 秒
+遅れるが、その代わり遅延 async event を吸収できる。
+
+### fixed delay ではなく per-session quiet grace
+
+「Stop から 2 秒」ではなく **「最後の関連イベントから 2 秒静か」**。
+Session ごとに `ClaudeGraceDueUtc` を持ち、Finalizing 中に同じ session へ
+Activity / TaskCreated / TaskCompleted / TaskSnapshot / TaskRemoved /
+TaskInProgress が来たら、適用した上で deadline をそこから 2 秒後へ延長する。
+Finalizing 中の重複 Stop も無視せず deadline を延長する。
+
+Win32 timer は最短 deadline 用の 1 本だけ (`ArmClaudeFinalizeTimer`)。
+発火時に期限の来た session だけを確定し、残りがあれば張り直す。
+常時 timer / polling は増やさない。Codex の `ArmCodexGraceTimer` とは
+timer ID も定数も別で、意味を共通化しない。
+
+### 早期 celebration を削除
+
+grace 中に 100% になっても「終わったよ！」を出さない。
+**最終的な completion を決められるのは quiet grace 満了後の `FinalizeDue` だけ**。
+以前あった「Finalizing 中に全完了になった瞬間 Celebrating」は廃止した。
+
+### 判定 (両 provider 共通の FinalizeDue)
+
+| 状態 | 結果 |
+|---|---|
+| total > 0 かつ done >= total | Celebrating |
+| total > 0 で pending が残る | StoppedIncomplete |
+| total > 0 で残りが in_progress のみ | Indeterminate |
+| total <= 0 で SawStructuredTasks | Indeterminate (格下げしない) |
+| total <= 0 で tracker 未観測 | Celebrating (従来の Stop ベース) |
+
+### bounded limitation
+
+これで司れるのは **quiet な 2 秒以内に届く遅延 event まで**。
+2 秒を超えてから届く Claude async event は完全には保証できない。
+それを埋めるには transcript 監視等が必要になり、privacy と
+軽量性の方針に反するので採用しない。
+
+### Codex は別物 (変更なし)
+
+Codex の 5 秒 quiet grace (`CodexQuietGraceMs = 5000`) は理由も値も別で、
+今回変えていない。Codex 側の変更は「malformed update_plan でも
+structured-observed を失わない」だけ。
 
 ## Nested Claude suppression
 

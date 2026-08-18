@@ -64,10 +64,14 @@ Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節�
 以下は壊さないこと:
 
 - Claude 側:
-  - 正規化イベント 1〜10 の意味と payload 契約を変更しない
-    (`src/Notify.cs` のイベント変換・payload 解析・nested 抑制は触らない)。
+  - 正規化イベント 1〜10 の意味を変えない。
   - Claude payload は 3 行のまま (4 行目の turn_id は Codex 専用)。
-  - `FinalizeGraceMs = 2000` (Claude の Finalizing) を理由なく変えない。
+  - nested Claude suppression を変えない。
+  - status 本文 (Todo/Task/plan step/command/response) を読まない。
+  - `structured-observed` は固定 metadata のみ。本文を乗せない。
+  - `FinalizeGraceMs = 2000` (Claude の quiet grace) を理由なく変えない。
+  - root Stop は常に Finalizing へ入る。grace 中の関連イベントで deadline を
+    延長し、completion を決めるのは `FinalizeDue` だけ (早期 celebration 禁止)。
   - Claude の完了判定を Codex 仕様へ共通化しない。
 - Codex 側 (`src/CodexNotify.cs` + `Pet.cs` の `OnCodexEvent`):
   - dwData 20〜27 が Codex 専用範囲。1〜10 へ混ぜない。

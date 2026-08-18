@@ -50,6 +50,11 @@ namespace CodexPetNotify
         private const int EvCodexSubagentStart = 26;
         private const int EvCodexSubagentStop = 27;
 
+        // update_plan を観測したが plan の status を解析できなかったときに
+        // Activity(21) の extra へ載せる固定 marker。plan step 本文は含まない。
+        // src/Pet.cs / src/Notify.cs の同名定数と文字列を一致させること。
+        private const string StructuredObserved = "structured-observed";
+
         // Codex では UserPromptSubmit / PermissionRequest / Stop を sync hook として
         // 登録するため、ペット自動起動の待ち時間は Claude (3秒) より短くする。
         private const int StartWaitMs = 1500;
@@ -104,8 +109,10 @@ namespace CodexPetNotify
                         {
                             string counts = CountPlanStatuses(json);
                             // snapshot を取れなかった場合は fail-closed:
-                            // 進捗を捏造せず activity として扱い、次の snapshot で自己修復する。
+                            // 進捗は捏造せず activity として扱うが、update_plan という
+                            // structured tracker を使った事実だけは marker で残す。
                             if (counts != null) { eventType = EvCodexPlanSnapshot; extra = counts; }
+                            else extra = StructuredObserved;
                         }
                         break;
 

@@ -6,13 +6,18 @@
 // 状態遷移 (Claude: session_id 単位):
 //   (なし) --UserPromptSubmit--> Working --permission_prompt--> Waiting
 //   Waiting --PostToolUse/UserPromptSubmit--> Working
-//   Working/Waiting --Stop--> Celebrating --(バウンド+約5秒)--> (エントリ削除=Idle)
+//   Working/Waiting --Stop--> Finalizing --(約2秒 quiet)--> Celebrating / 未完表示
 //   SessionEnd --> エントリ削除
+//
+// Claude の Stop は常に Finalizing へ入る。hook が async なので、Stop より前に
+// 発生した TaskCreated/TodoWrite が Stop の後から届きうるため。grace 中に関連
+// イベントが来たら静穏時間を数え直し、完了は FinalizeDue だけが決める
+// (100% になっても grace 中は「終わったよ！」を出さない)。
 //
 // Codex は provider+session+turn 単位の別イベント系 (dwData 20〜27) で入ってくる。
 // Claude 側の判定・定数を共通化せず、provider 固有の最小分岐だけを持つ:
 //   Stop は即完了ではなく 5 秒 quiet grace の completion candidate
-//   (Claude の Finalizing 約2秒とは別理由・別定数。docs/DESIGN_DECISIONS.md 参照)
+//   (Claude の 2 秒とは別理由・別定数。docs/DESIGN_DECISIONS.md 参照)
 //
 // 表示は常にペット1匹。優先度 Waiting > Celebrating > Working、同率は最新イベントの session。
 //
@@ -220,6 +225,12 @@ namespace ClaudePet
         public const int CodexSubagentStart = 26;  // SubagentStart
         public const int CodexSubagentStop = 27;   // SubagentStop (root completion にしない)
         public const int CodexLast = 27;
+
+        // Activity(4 / 21) の extra に載る固定 marker。structured tracker
+        // (TodoWrite / Task 系 / update_plan) を観測したが status を解析できなかった、
+        // という事実だけを伝える。本文は一切含まない。
+        // src/Notify.cs / src/CodexNotify.cs の同名定数と一致させること。
+        public const string StructuredObserved = "structured-observed";
     }
 
     internal sealed class Session
@@ -260,10 +271,15 @@ namespace ClaudePet
 
         public const int MaxTaskIds = 256;
 
-        // この依頼で structured task (Task/TodoWrite/update_plan) を一度でも観測したか。
-        // 観測済みなら Stop だけでは完了と認めない (下記 NeedsReconciliation)。
-        // 依頼単位のフラグで、途中で snapshot を失っても false へ戻さない (fail-closed)。
+        // この依頼/turn で structured task tracker (Task/TodoWrite/update_plan) を
+        // 一度でも観測したか。「今 valid な snapshot があるか」ではない点に注意。
+        // status の解析に失敗した観測 (StructuredObserved marker) でも true になり、
+        // ResetRequest() 以外では false へ戻さない (fail-closed)。
         public bool SawStructuredTasks;
+
+        // Claude の Finalizing quiet grace 満了時刻 (未設定=MinValue)。
+        // Codex の CodexGraceDueUtc とは値も意味も別物なので共通化しない。
+        public DateTime ClaudeGraceDueUtc;
 
         public void ResetRequest()
         {
@@ -272,6 +288,7 @@ namespace ClaudePet
             SnapDone = 0;
             SnapInProg = 0;
             SawStructuredTasks = false;
+            ClaudeGraceDueUtc = DateTime.MinValue;
             if (CreatedIds != null) { CreatedIds.Clear(); CompletedIds.Clear(); InProgressIds.Clear(); }
         }
 
@@ -309,19 +326,6 @@ namespace ClaudePet
             if (total <= 0) return -1;
             int pct = (int)Math.Floor((done + 0.5 * inProg) * 100.0 / total);
             return pct > 100 ? 100 : pct;
-        }
-
-        // 完了ゲート: Stop を受けても即「終わったよ！」にできないか。
-        //   structured task を観測した依頼 → 全部 completed を確認できたときだけ false
-        //   一度も観測していない依頼        → 常に false (従来どおり Stop を完了根拠にする)
-        // 観測済みなのに total が取れない (snapshot 欠落・subagent で無効化 等) 場合も
-        // true を返し、「task なし依頼」へ格下げして完了扱いすることを防ぐ。
-        public bool NeedsReconciliation()
-        {
-            int done, inProg, total;
-            GetProgress(out done, out inProg, out total);
-            if (total > 0) return done < total;
-            return SawStructuredTasks;
         }
     }
 
@@ -553,7 +557,6 @@ namespace ClaudePet
             _sessions.TryGetValue(sessionId, out s);
 
             bool becameWaiting = false;
-            bool becameCelebrating = false;
 
             switch (eventType)
             {
@@ -561,7 +564,7 @@ namespace ClaudePet
                     _recentlyEnded.Remove(sessionId); // 正当な再開
                     s = Upsert(sessionId, s, project, true);
                     s.State = Session.Working;
-                    s.ResetRequest(); // 新しい依頼: 前回依頼の進捗を破棄
+                    s.ResetRequest(); // 新しい依頼: 前回依頼の進捗と完了候補を破棄
                     break;
 
                 case PetEvent.Activity:
@@ -582,13 +585,14 @@ namespace ClaudePet
                     s = Upsert(sessionId, s, project, false);
                     if (s.State != Session.Finalizing) s.State = Session.Working;
                     s.LastActivityUtc = DateTime.UtcNow; // 「● 活動中」
+                    // status を読めなかった tracker 観測。進捗値は触らず事実だけ残す
+                    if (extra == PetEvent.StructuredObserved) s.SawStructuredTasks = true;
                     ApplyTaskEvent(s, eventType, extra);
-                    // grace 中に全完了が確定したら celebration へ (「途中で止まったよ」を見せない)
-                    if (s.State == Session.Finalizing && !s.NeedsReconciliation())
-                    {
-                        s.State = Session.Celebrating;
-                        becameCelebrating = true;
-                    }
+                    // grace 中に関連イベントが来たら静穏時間を数え直す。
+                    // ここでは絶対に celebration しない (100% になっても同じ)。
+                    // 完了を決められるのは quiet grace 満了後の FinalizeDue だけ。
+                    if (s.State == Session.Finalizing)
+                        s.ClaudeGraceDueUtc = DateTime.UtcNow.AddMilliseconds(FinalizeGraceMs);
                     break;
 
                 case PetEvent.PermissionPrompt:
@@ -600,23 +604,16 @@ namespace ClaudePet
                     break;
 
                 case PetEvent.TaskComplete:
-                    // debounce: 同一依頼の重複 Stop / 遅延 Stop で二重処理しない
-                    if (s != null && (s.State == Session.Celebrating || s.State == Session.Finalizing))
-                    { Touch(s, project); break; }
+                    // 判定済みの表示中は蒸し返さない
+                    if (s != null && IsTerminal(s.State)) { Touch(s, project); break; }
                     if (s == null && IsTombstoned(sessionId)) return;
                     s = Upsert(sessionId, s, project, true);
-                    if (s.NeedsReconciliation())
-                    {
-                        // 即「途中で止まったよ」と断定せず、遅延した完了イベントを
-                        // grace window (2秒) だけ待つ。UI は Working 表示のまま。
-                        s.State = Session.Finalizing;
-                        Native.SetTimer(_hwnd, TimerFinalize, FinalizeGraceMs, IntPtr.Zero);
-                    }
-                    else
-                    {
-                        s.State = Session.Celebrating;
-                        becameCelebrating = true;
-                    }
+                    // structured task を観測済みかどうかに関わらず必ず quiet grace へ入る。
+                    // Claude の hook は async なので、Stop より前に発生した
+                    // TaskCreated/TodoWrite が Stop の後から届くことがある。
+                    // UI は Working 表示のまま。重複 Stop は deadline を延長する。
+                    s.State = Session.Finalizing;
+                    s.ClaudeGraceDueUtc = DateTime.UtcNow.AddMilliseconds(FinalizeGraceMs);
                     break;
 
                 case PetEvent.SessionEnd:
@@ -635,7 +632,9 @@ namespace ClaudePet
             }
             if (s != null) Touch(s, project);
 
-            AfterEvent(sessionId, becameCelebrating, becameWaiting);
+            ArmClaudeFinalizeTimer();
+            // Claude は Stop 直後に Celebrating しない (FinalizeDue が決める)
+            AfterEvent(sessionId, false, becameWaiting);
         }
 
         // イベント処理後の共通後処理 (prune / 音 / 再描画 / アニメ)。
@@ -708,10 +707,16 @@ namespace ClaudePet
                     // work activity が来た = まだ終わっていない。completion candidate を破棄する
                     s.CodexGraceDueUtc = DateTime.MinValue;
                     s.State = Session.Working;
-                    // subagent を含む turn では update_plan の origin を証明できないため
-                    // root progress へ適用しない (SubagentStop 後もその turn 中は再開しない)
-                    if (eventType == PetEvent.CodexPlanSnapshot && !s.TurnHasSubagent)
-                        ApplyTaskEvent(s, PetEvent.TaskSnapshot, extra);
+                    // status を読めなかった update_plan 観測。進捗値は触らず事実だけ残す
+                    if (extra == PetEvent.StructuredObserved) s.SawStructuredTasks = true;
+                    if (eventType == PetEvent.CodexPlanSnapshot)
+                    {
+                        // tracker を使った事実は subagent 抑制中でも失わない
+                        s.SawStructuredTasks = true;
+                        // ただし subagent を含む turn では origin を証明できないので
+                        // root progress へは適用しない (SubagentStop 後も再開しない)
+                        if (!s.TurnHasSubagent) ApplyTaskEvent(s, PetEvent.TaskSnapshot, extra);
+                    }
                     break;
 
                 case PetEvent.CodexPermission:
@@ -788,6 +793,25 @@ namespace ClaudePet
             return state == Session.Celebrating ||
                    state == Session.StoppedIncomplete ||
                    state == Session.Indeterminate;
+        }
+
+        // Claude の quiet grace も session ごとに満了時刻を持ち、timer は最短期限へ
+        // 1 本だけ張る。Codex 用 (ArmCodexGraceTimer) とは timer ID も定数も別。
+        private void ArmClaudeFinalizeTimer()
+        {
+            DateTime next = DateTime.MaxValue;
+            foreach (var kv in _sessions)
+            {
+                Session s = kv.Value;
+                if (s.IsCodex || s.State != Session.Finalizing) continue;
+                if (s.ClaudeGraceDueUtc == DateTime.MinValue) continue;
+                if (s.ClaudeGraceDueUtc < next) next = s.ClaudeGraceDueUtc;
+            }
+            Native.KillTimer(_hwnd, TimerFinalize);
+            if (next == DateTime.MaxValue) return;
+            double ms = (next - DateTime.UtcNow).TotalMilliseconds;
+            if (ms < 30) ms = 30;
+            Native.SetTimer(_hwnd, TimerFinalize, (uint)ms, IntPtr.Zero);
         }
 
         // Codex の quiet grace は session ごとに満了時刻を持ち、timer は最短期限へ
@@ -875,9 +899,9 @@ namespace ClaudePet
                     s.SnapTotal = total; // total=0 は「リストが空になった」= 進捗表示なし
                     s.SnapDone = done;
                     s.SnapInProg = inProg;
-                    // 1 件以上見えた snapshot だけを「structured task を使う依頼」の根拠にする。
-                    // 後から total=0 (リスト全消し) になっても false へは戻さない。
-                    if (total > 0) s.SawStructuredTasks = true;
+                    // snapshot を正常に解析できた = tracker を使っている。件数は問わない
+                    // (total=0 のリスト全消しでも「tracker なし依頼」へは格下げしない)。
+                    s.SawStructuredTasks = true;
                     break;
             }
         }
@@ -1050,11 +1074,13 @@ namespace ClaudePet
             MoveTo(_baseX, _baseY - offset);
         }
 
-        // Stop後grace満了: Finalizing のままのセッションを最終判定する
+        // Claude quiet grace 満了: 期限の来た Claude セッションだけ確定し、
+        // 残りがあれば最短期限へ timer を張り直す (one-shot のまま)。
         private void OnFinalizeTick()
         {
             Native.KillTimer(_hwnd, TimerFinalize);
             FinalizeDue(false);
+            ArmClaudeFinalizeTimer();
         }
 
         // Codex quiet grace 満了: 期限の来た Codex セッションだけ確定し、
@@ -1080,10 +1106,11 @@ namespace ClaudePet
                 Session s = kv.Value;
                 if (s.State != Session.Finalizing) continue;
                 if (s.IsCodex != codex) continue;
-                // Codex は session ごとに満了時刻を持つ (再 Stop で伸びる)。
+                // 両 provider とも session ごとに満了時刻を持つ (再 Stop / 関連イベントで伸びる)。
                 // 期限未設定 = candidate 無し。推測 timeout で確定させない。
-                if (codex && s.CodexGraceDueUtc == DateTime.MinValue) continue;
-                if (codex && s.CodexGraceDueUtc > now.AddMilliseconds(50)) continue;
+                DateTime due = codex ? s.CodexGraceDueUtc : s.ClaudeGraceDueUtc;
+                if (due == DateTime.MinValue) continue;
+                if (due > now.AddMilliseconds(50)) continue;
                 int done, inProg, total;
                 s.GetProgress(out done, out inProg, out total);
                 if (total <= 0)
@@ -1126,6 +1153,7 @@ namespace ClaudePet
                     alerted = true;
                 }
                 s.CodexGraceDueUtc = DateTime.MinValue;
+                s.ClaudeGraceDueUtc = DateTime.MinValue;
                 _seq++;
                 s.LastSeq = _seq;
                 s.LastAtUtc = DateTime.UtcNow;

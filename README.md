@@ -119,11 +119,15 @@ progress bar と「**全体 推定 N%**」を表示する。Task 件数 (3/5 等
 
 「終わったよ！」は「**ユーザーが投げた依頼全体が完了した**」ときだけ出す。
 
+Claude は **Stop を受けたら必ず約 2 秒待ち**、遅れて届く structured event が
+ないことを確かめてから完了通知する (hook が async なため、Stop より前に
+発生した Task/Todo イベントが Stop の後から届くことがある)。
+grace 中に関連イベントが来たら、そこからまた 2 秒静かになるまで待つ。
+
 ```
 Stop 受信
-  ├─ 未完 Task なし → 終わったよ！
-  └─ 未完 Task あり → Finalizing (約2秒の grace。UI は作業中のまま)
-        ├─ grace 中に完了イベント到着で全完了 → 終わったよ！ (未完表示は一度も出さない)
+  └─ 常に Finalizing (約2秒の quiet grace。UI は作業中のまま)
+        ├─ grace 中の関連イベントで grace を数え直す (100% になってもその場では通知しない)
         └─ grace 満了
               ├─ 未着手 (pending) Task が残る → 途中で止まったよ (明確に未完)
               └─ 残りが in_progress のみ → 終わったか確認してね (断定しない)
@@ -133,7 +137,11 @@ Stop 受信
 - **Task の削除/キャンセル (`TaskUpdate` status=deleted/cancelled) には対応する hook が発火しない**
   (実測)。PostToolUse から検知して total から除外する (これを怠ると「完了したのに
   途中で止まったよ」という false incomplete になる)
-- Task の無い依頼: 構造化された判定材料がないため、Stop を完了として扱う
+- Task の無い依頼: 2 秒静穏の間に structured event が一つも来なければ
+  Stop を完了として扱う
+- 逆に **Todo / Task / update_plan を一度でも使った依頼**では、status を読めなかった
+  場合でも「task なし依頼」へ格下げせず、全件 completed を確認できない限り
+  「終わったよ！」は出さない
 - 同一依頼への重複 Stop / 遅延イベントでは celebration は1回だけ (debounce + tombstone)
 - StoppedIncomplete / Indeterminate は次の依頼 (UserPromptSubmit) で解除。終了済み
   セッションが表示を塞ぎ続けないよう最大10分で自動消滅
@@ -338,7 +346,9 @@ Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$e
 ## Limitations
 
 - 進捗はあくまで heuristic。Claude がタスクリストを整理し直すと数字が前後する
-- Task を使わない依頼では Stop ベースの完了判定になる (短い応答でも「終わったよ！」)
+- Task を使わない依頼では Stop ベースの完了判定になる (短い応答でも「終わったよ！」)。
+  ただし Claude では遅延 event を待つため通知が約 2 秒遅れる
+- 2 秒を超えてから届く Claude の async event までは司れない (bounded)
 - 完了判定は Claude 自身の task lifecycle (status 更新) に依存する。grace (約2秒) を超える
   極端な async 遅延では「終わったか確認してね」になることがある
 - nested 検出の限界: 子 Claude を起動した中間シェルが先に終了するとチェーンが切れて
