@@ -64,7 +64,8 @@ Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節�
 以下は壊さないこと:
 
 - Claude 側:
-  - `src/Notify.cs` (Claude adapter) と正規化イベント 1〜10 の意味を変更しない。
+  - 正規化イベント 1〜10 の意味と payload 契約を変更しない
+    (`src/Notify.cs` のイベント変換・payload 解析・nested 抑制は触らない)。
   - Claude payload は 3 行のまま (4 行目の turn_id は Codex 専用)。
   - `FinalizeGraceMs = 2000` (Claude の Finalizing) を理由なく変えない。
   - Claude の完了判定を Codex 仕様へ共通化しない。
@@ -78,10 +79,12 @@ Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節�
   - `update_plan` の status 件数だけを数える。snapshot を取れなければ進捗を出さない。
   - subagent を検知した turn では progress を信用しない (fail-closed)。
   - rollout watcher / App Server 常駐 / PreToolUse hook を導入しない。
-  - ペット自動起動は `UseShellExecute = true`。false へ戻すと hook の stdout を
-    ペットが掘んだままになり、sync hook がブロックする。
   - `install-codex-hook.ps1` は `config.toml` を書き換えない。
     `--dangerously-bypass-hook-trust` を production 設定へ入れない。
+- 両 adapter 共通:
+  - ペット自動起動は `UseShellExecute = true`。false へ戻すと hook の
+    stdin/stdout/stderr をペットが掴んだままになり、stdout を EOF まで
+    読む hook runner がブロックする (実測)。
 
 ## Before changing behavior
 

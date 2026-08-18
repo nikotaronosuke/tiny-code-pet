@@ -190,8 +190,6 @@ Codex 側 (詳細は「Codex support」節):
 - interrupt では Stop が来ないので Working 表示が残る。次の依頼まで解除しない。
 - Codex 側に nested 抑制 (Claude の process ancestor chain 相当) は無い。
 - 未実施: 実 Codex での live verification (Hooks 未インストールのため)。
-- `ClaudePetNotify` のペット自動起動は未だハンドルを継承する
-  (async hook のみなので潜在的。上記「ペット自動起動は ShellExecute」参照)。
 
 絶対に壊してはいけない設計原則 (AGENTS.md の正本を参照):
 
@@ -386,12 +384,12 @@ production の方針:
 
 ### ペット自動起動は ShellExecute (ハンドルを継承させない)
 
-`CodexPetNotify` がペットを自動起動するときは
+`CodexPetNotify` / `ClaudePetNotify` の**両方**がペットを自動起動するときは
 `ProcessStartInfo.UseShellExecute = true` を使う。**戻さないこと。**
 
 - `UseShellExecute = false` は CreateProcess を `bInheritHandles = TRUE` で呼ぶため、
   hook の stdin/stdout/stderr がそのまま常駐ペットへ継承される。
-  helper が終了してもペットが hook の stdout を掘んだままになるので、
+  helper が終了してもペットが hook の stdout を掴んだままになるので、
   stdout を EOF まで読む hook runner は**ペットの生存中ずっとブロック**する
   (リダイレクト先ファイルを排他オープンできないことで実測確認済み)。
 - Codex は UserPromptSubmit / PermissionRequest / Stop を **sync hook** として登録し、
@@ -405,9 +403,12 @@ production の方針:
   (ビルド直後の初回起動だけ AV スキャンで数十秒かかることがあるが、
    これは起動方式とは無関係)。
 
-**既知: `ClaudePetNotify` 側には同じ問題が残っている。** Claude の hook は
-全て async なのでセッションをブロックせず、またペットが既に起動していれば
-この経路を通らないため潜在的。Codex 対応とは別の変更として扱う。
+`ClaudePetNotify` も同じ問題を持っていたため、Codex 対応とは別 commit で
+同じ方式へ修正済み (Claude の hook は全て async なので潜在的だった)。
+修正後の実測: 両 helper とも stdin / stdout / stderr のいずれも
+helper 終了後に排他オープンできる (= ペットが持っていない)。
+Claude 側の変更はこの 1 行だけで、event 1〜10 ・payload 解析・
+nested 抑制は一切触っていない。
 
 ### privacy (Codex でも変えない)
 

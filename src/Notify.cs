@@ -459,8 +459,15 @@ namespace ClaudePetNotify
                 string dir = AppDomain.CurrentDomain.BaseDirectory;
                 string petExe = Path.Combine(dir, "ClaudePet.exe");
                 if (!File.Exists(petExe)) return IntPtr.Zero;
+                // UseShellExecute=false は CreateProcess を bInheritHandles=TRUE で
+                // 呼ぶため、hook の stdin/stdout/stderr が常駐ペットへ継承される。
+                // helper が終了してもペットが hook の stdout を掴んだままになり、
+                // stdout を EOF まで読む hook runner がペットの生存中ブロックする
+                // (実測で再現)。ShellExecute はハンドルを一切渡さないので使わない。
+                // ペットは CWD に依存しない (debug ファイルは exe と同じ場所)。
+                // docs/DESIGN_DECISIONS.md「ペット自動起動は ShellExecute」参照。
                 var psi = new ProcessStartInfo(petExe);
-                psi.UseShellExecute = false;
+                psi.UseShellExecute = true;
                 Process.Start(psi);
             }
             catch { return IntPtr.Zero; }
