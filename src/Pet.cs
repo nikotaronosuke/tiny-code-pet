@@ -260,12 +260,18 @@ namespace ClaudePet
 
         public const int MaxTaskIds = 256;
 
+        // この依頼で structured task (Task/TodoWrite/update_plan) を一度でも観測したか。
+        // 観測済みなら Stop だけでは完了と認めない (下記 NeedsReconciliation)。
+        // 依頼単位のフラグで、途中で snapshot を失っても false へ戻さない (fail-closed)。
+        public bool SawStructuredTasks;
+
         public void ResetRequest()
         {
             RequestGen++;
             SnapTotal = -1;
             SnapDone = 0;
             SnapInProg = 0;
+            SawStructuredTasks = false;
             if (CreatedIds != null) { CreatedIds.Clear(); CompletedIds.Clear(); InProgressIds.Clear(); }
         }
 
@@ -305,12 +311,17 @@ namespace ClaudePet
             return pct > 100 ? 100 : pct;
         }
 
-        // 完了ゲート: Todo を使った依頼で未完項目が残っているか
-        public bool HasUnfinishedTasks()
+        // 完了ゲート: Stop を受けても即「終わったよ！」にできないか。
+        //   structured task を観測した依頼 → 全部 completed を確認できたときだけ false
+        //   一度も観測していない依頼        → 常に false (従来どおり Stop を完了根拠にする)
+        // 観測済みなのに total が取れない (snapshot 欠落・subagent で無効化 等) 場合も
+        // true を返し、「task なし依頼」へ格下げして完了扱いすることを防ぐ。
+        public bool NeedsReconciliation()
         {
             int done, inProg, total;
             GetProgress(out done, out inProg, out total);
-            return total > 0 && done < total;
+            if (total > 0) return done < total;
+            return SawStructuredTasks;
         }
     }
 
@@ -386,8 +397,11 @@ namespace ClaudePet
             try { dpi = Native.GetDpiForSystem(); } catch { }
             _scale = dpi / 96f;
 
-            _winW = S(280);
-            _winH = S(252); // 進捗付き Working ピルが収まる高さ (キャラ位置は下端基準で不変)
+            _winW = S(280); // ピル内テキストの幅で決まる (文字サイズを変えないので不変)
+            // 上余白10 + 最大 Working ピル109 + キャラとの間隔10 + キャラ〜ラベル74。
+            // キャラを半分にした分だけ縮めた (252 -> 204)。キャラは下端基準なので
+            // 画面上の位置は従来と変わらない。
+            _winH = S(204);
 
             Native.RECT work = new Native.RECT();
             Native.SystemParametersInfo(0x0030 /*SPI_GETWORKAREA*/, 0, ref work, 0);
@@ -570,7 +584,7 @@ namespace ClaudePet
                     s.LastActivityUtc = DateTime.UtcNow; // 「● 活動中」
                     ApplyTaskEvent(s, eventType, extra);
                     // grace 中に全完了が確定したら celebration へ (「途中で止まったよ」を見せない)
-                    if (s.State == Session.Finalizing && !s.HasUnfinishedTasks())
+                    if (s.State == Session.Finalizing && !s.NeedsReconciliation())
                     {
                         s.State = Session.Celebrating;
                         becameCelebrating = true;
@@ -591,7 +605,7 @@ namespace ClaudePet
                     { Touch(s, project); break; }
                     if (s == null && IsTombstoned(sessionId)) return;
                     s = Upsert(sessionId, s, project, true);
-                    if (s.HasUnfinishedTasks())
+                    if (s.NeedsReconciliation())
                     {
                         // 即「途中で止まったよ」と断定せず、遅延した完了イベントを
                         // grace window (2秒) だけ待つ。UI は Working 表示のまま。
@@ -836,6 +850,7 @@ namespace ClaudePet
                     s.CreatedIds.Add(extra); // 完了/着手イベントが先に来ても total に数える (100% 超え防止)
                     if (eventType == PetEvent.TaskCompleted) s.CompletedIds.Add(extra);
                     else if (eventType == PetEvent.TaskInProgress) s.InProgressIds.Add(extra);
+                    s.SawStructuredTasks = true;
                     break;
 
                 case PetEvent.TaskRemoved:
@@ -860,6 +875,9 @@ namespace ClaudePet
                     s.SnapTotal = total; // total=0 は「リストが空になった」= 進捗表示なし
                     s.SnapDone = done;
                     s.SnapInProg = inProg;
+                    // 1 件以上見えた snapshot だけを「structured task を使う依頼」の根拠にする。
+                    // 後から total=0 (リスト全消し) になっても false へは戻さない。
+                    if (total > 0) s.SawStructuredTasks = true;
                     break;
             }
         }
@@ -1010,7 +1028,8 @@ namespace ClaudePet
         {
             int totalFrames = (_animMode == AnimCelebrate) ? 44 : 22; // 約1.3秒 / 約0.65秒
             int bounces = (_animMode == AnimCelebrate) ? 3 : 2;
-            int amplitude = (_animMode == AnimCelebrate) ? S(22) : S(10);
+            // キャラを半分にしたので跳ね幅も半分 (体の大きさに対する比を保つ)
+            int amplitude = (_animMode == AnimCelebrate) ? S(11) : S(5);
 
             _bounceFrame++;
             if (_bounceFrame >= totalFrames)
@@ -1067,9 +1086,29 @@ namespace ClaudePet
                 if (codex && s.CodexGraceDueUtc > now.AddMilliseconds(50)) continue;
                 int done, inProg, total;
                 s.GetProgress(out done, out inProg, out total);
-                if (total <= 0 || done >= total)
+                if (total <= 0)
                 {
-                    s.State = Session.Celebrating; // grace中の遅延イベントで完了が確定していた
+                    if (s.SawStructuredTasks)
+                    {
+                        // この依頼では task を観測したのに、今は件数が取れない
+                        // (snapshot 欠落 / リスト全消し / subagent で無効化)。
+                        // 「task なし依頼」へ格下げして完了扱いにはしない。
+                        s.State = Session.Indeterminate;
+                        alerted = true;
+                    }
+                    else
+                    {
+                        // structured task を一度も観測していない依頼だけ、
+                        // 従来どおり Stop を完了根拠にする (短い依頼の通知を失わない)。
+                        s.State = Session.Celebrating;
+                        celebrated = true;
+                        celebratedId = kv.Key;
+                    }
+                }
+                else if (done >= total)
+                {
+                    // 全タスク completed を確認できた + Stop → ここだけが「終わったよ！」
+                    s.State = Session.Celebrating;
                     celebrated = true;
                     celebratedId = kv.Key;
                 }
@@ -1219,7 +1258,7 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawWorkingPill(g, w, scale, project, pct, active);
+                DrawWorkingPill(g, w, h, scale, project, pct, active);
             }
             return bmp;
         }
@@ -1231,7 +1270,7 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawPill(g, w, scale, "終わったか確認してね", project,
+                DrawPill(g, w, h, scale, "終わったか確認してね", project,
                     Color.FromArgb(242, 255, 248, 228),   // 背景: 淡い黄 (Waiting より薄い)
                     Color.FromArgb(255, 214, 178, 96),    // 枠: 薄いオレンジ
                     Color.FromArgb(255, 150, 110, 40),    // 文字: 茶寄りオレンジ
@@ -1247,7 +1286,7 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawPill(g, w, scale, "途中で止まったよ", project,
+                DrawPill(g, w, h, scale, "途中で止まったよ", project,
                     Color.FromArgb(242, 245, 236, 226),   // 背景: 淡いベージュ
                     Color.FromArgb(255, 196, 156, 108),   // 枠: 茶系
                     Color.FromArgb(255, 140, 96, 48),     // 文字: 濃い茶
@@ -1257,7 +1296,7 @@ namespace ClaudePet
         }
 
         // Working 用ピル: 作業中… / [progress bar + 全体 推定 N%] / [● 活動中] / [project]
-        private static void DrawWorkingPill(Graphics g, int w, float scale, string project, int pct, bool active)
+        private static void DrawWorkingPill(Graphics g, int w, int h, float scale, string project, int pct, bool active)
         {
             Color bg = Color.FromArgb(205, 250, 250, 248);
             Color border = Color.FromArgb(255, 210, 205, 196);
@@ -1275,9 +1314,11 @@ namespace ClaudePet
             if (hasProject) cursor += 19f;
 
             float bx = 24 * scale;
-            float by = 10 * scale;
             float bw = w - 48 * scale;
             float bh = (cursor + 7f) * scale;
+            // しっぽ無しなのでキャラのすぐ上へ。中身が増減しても頭との距離は一定。
+            float by = ChickTopY(h, scale) - 10 * scale - bh;
+            if (by < 10 * scale) by = 10 * scale; // 上端はみ出し防止 (念のため)
 
             using (GraphicsPath path = RoundedRect(bx, by, bw, bh, 12 * scale))
             {
@@ -1342,7 +1383,7 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawPill(g, w, scale, "確認して！", project,
+                DrawPill(g, w, h, scale, "確認して！", project,
                     Color.FromArgb(242, 255, 243, 214),   // 背景: 淡い黄
                     Color.FromArgb(255, 226, 160, 66),    // 枠: オレンジ
                     Color.FromArgb(255, 168, 96, 24),     // 文字: 濃いオレンジ
@@ -1357,7 +1398,7 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawPill(g, w, scale, "終わったよ！", project,
+                DrawPill(g, w, h, scale, "終わったよ！", project,
                     Color.FromArgb(238, 255, 255, 255),   // 背景: 白
                     Color.FromArgb(255, 205, 198, 188),   // 枠: グレー
                     Color.FromArgb(255, 70, 62, 54),      // 文字: 濃いグレー
@@ -1379,46 +1420,59 @@ namespace ClaudePet
             return g;
         }
 
+        // キャラ本体だけの倍率。文字サイズ (ピル・ラベル) には掛けない。
+        private const float ChickScale = 0.5f;
+
+        // キャラ頭頂の y (window 座標)。ピル類はこれを基準に下端を合わせるので、
+        // 中身の量で高さが変わってもキャラとの距離は一定に保たれる。
+        private static float ChickTopY(int h, float scale)
+        {
+            return h - 56 * scale - 36 * scale * ChickScale;
+        }
+
         private static void DrawChick(Graphics g, int w, int h, float scale)
         {
+            // s = キャラ内部の寸法用 (線幅・パーツも比例縮小)。
+            // 配置は window 単位 (scale) のままなので、足元は従来と同じ画面位置に残る。
+            float s = scale * ChickScale;
             float cx = w / 2f;
-            float cy = h - 78 * scale;
-            float r = 36 * scale;
+            float cy = h - 56 * scale;
+            float r = 36 * s;
 
             // 足
-            using (var pen = new Pen(BeakColor, 2.5f * scale))
+            using (var pen = new Pen(BeakColor, 2.5f * s))
             {
-                g.DrawLine(pen, cx - 12 * scale, cy + r - 4 * scale, cx - 14 * scale, cy + r + 8 * scale);
-                g.DrawLine(pen, cx + 12 * scale, cy + r - 4 * scale, cx + 14 * scale, cy + r + 8 * scale);
+                g.DrawLine(pen, cx - 12 * s, cy + r - 4 * s, cx - 14 * s, cy + r + 8 * s);
+                g.DrawLine(pen, cx + 12 * s, cy + r - 4 * s, cx + 14 * s, cy + r + 8 * s);
             }
 
             // 体
             using (var body = new SolidBrush(BodyColor))
                 g.FillEllipse(body, cx - r, cy - r, r * 2, r * 2);
-            using (var edge = new Pen(BodyEdge, 2f * scale))
+            using (var edge = new Pen(BodyEdge, 2f * s))
                 g.DrawEllipse(edge, cx - r, cy - r, r * 2, r * 2);
 
             // 羽
-            using (var wing = new Pen(BodyEdge, 2f * scale))
+            using (var wing = new Pen(BodyEdge, 2f * s))
             {
-                g.DrawArc(wing, cx - r + 4 * scale, cy - 6 * scale, 18 * scale, 20 * scale, 60, 180);
-                g.DrawArc(wing, cx + r - 22 * scale, cy - 6 * scale, 18 * scale, 20 * scale, -60, 180);
+                g.DrawArc(wing, cx - r + 4 * s, cy - 6 * s, 18 * s, 20 * s, 60, 180);
+                g.DrawArc(wing, cx + r - 22 * s, cy - 6 * s, 18 * s, 20 * s, -60, 180);
             }
 
             // 目
             using (var eye = new SolidBrush(Color.FromArgb(40, 34, 28)))
             {
-                float er = 4f * scale;
-                g.FillEllipse(eye, cx - 14 * scale - er, cy - 10 * scale - er, er * 2, er * 2);
-                g.FillEllipse(eye, cx + 14 * scale - er, cy - 10 * scale - er, er * 2, er * 2);
+                float er = 4f * s;
+                g.FillEllipse(eye, cx - 14 * s - er, cy - 10 * s - er, er * 2, er * 2);
+                g.FillEllipse(eye, cx + 14 * s - er, cy - 10 * s - er, er * 2, er * 2);
             }
 
             // ほっぺ
             using (var cheek = new SolidBrush(CheekColor))
             {
-                float chr = 5.5f * scale;
-                g.FillEllipse(cheek, cx - 24 * scale - chr, cy + 2 * scale - chr, chr * 2, chr * 2);
-                g.FillEllipse(cheek, cx + 24 * scale - chr, cy + 2 * scale - chr, chr * 2, chr * 2);
+                float chr = 5.5f * s;
+                g.FillEllipse(cheek, cx - 24 * s - chr, cy + 2 * s - chr, chr * 2, chr * 2);
+                g.FillEllipse(cheek, cx + 24 * s - chr, cy + 2 * s - chr, chr * 2, chr * 2);
             }
 
             // くちばし
@@ -1426,9 +1480,9 @@ namespace ClaudePet
             {
                 PointF[] tri = new PointF[]
                 {
-                    new PointF(cx - 6 * scale, cy - 2 * scale),
-                    new PointF(cx + 6 * scale, cy - 2 * scale),
-                    new PointF(cx, cy + 8 * scale)
+                    new PointF(cx - 6 * s, cy - 2 * s),
+                    new PointF(cx + 6 * s, cy - 2 * s),
+                    new PointF(cx, cy + 8 * s)
                 };
                 g.FillPolygon(beak, tri);
             }
@@ -1446,15 +1500,18 @@ namespace ClaudePet
         }
 
         // キャラ上部の吹き出し/ピル。tail=true で吹き出しのしっぽ付き。
-        private static void DrawPill(Graphics g, int w, float scale, string mainText, string project,
+        private static void DrawPill(Graphics g, int w, int h, float scale, string mainText, string project,
             Color bg, Color border, Color textColor, bool tail, float mainSize)
         {
             float bx = 24 * scale;
-            float by = 14 * scale;
             float bw = w - 48 * scale;
             bool hasProject = !string.IsNullOrEmpty(project);
             float bh = (hasProject ? 76 : 56) * scale;
             float rad = 12 * scale;
+            // しっぽの先がキャラの頭上に来るよう下端基準で配置する。
+            float tailH = tail ? 10 * scale : 0f;
+            float by = ChickTopY(h, scale) - 19 * scale - tailH - bh;
+            if (by < 10 * scale) by = 10 * scale; // 上端はみ出し防止 (念のため)
 
             using (GraphicsPath path = RoundedRect(bx, by, bw, bh, rad))
             {
