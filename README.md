@@ -6,33 +6,33 @@ Claude Code / Codex の状態を、デスクトップ右下の小さなひよこ
 把握できる **超軽量デスクトップ通知キャラクター** です。
 Claude Code と Codex を同時に使っても session / 状態は衝突しません。
 
+完全 auto 運用向けに、見える状態は 3 つだけ:
+
 | 状態 | 表示 | 意味 |
 |---|---|---|
 | Idle | 🐣 + `Claude` | 何もしていない。完全静止 |
-| Working | 🐣 + 「作業中…」+ project名 | 放置してよい (グレーのピル・静止) |
-| Working (Taskあり) | 🐣 + 「作業中…」+ progress bar + 「**全体 推定 N%**」+ project名 | 今投げた依頼全体のおおよその進み具合。Task 件数 (3/5 等) は表示しない |
-| Waiting | 🐣 + 「確認して！」+ project名 | **permission承認待ち。見に行く必要あり** (オレンジ吹き出し・軽く2回ピョコ・警告音1回) |
-| StoppedIncomplete | 🐣 + 「途中で止まったよ」+ project名 | **未着手 Task を残したまま停止** (ベージュ吹き出し・警告音1回・最大10分表示) |
-| Indeterminate | 🐣 + 「終わったか確認してね」+ project名 | Stop したが残 Task が in_progress のみ = **完了とも未完とも断定できない** (薄オレンジ吹き出し・警告音1回・最大10分表示) |
-| Completed | 🐣 + 「終わったよ！」+ project名 | **依頼全体が本当に完了** (白吹き出し・3回ピョコピョコ・通知音1回・約5秒後に次の表示へ) |
+| 作業中 | 🐣 + 「作業中…」(+ 「**全体 推定 N%**」) + project名 | 放置してよい。permission 待ちも、Stop 後の静穏待ちも、すべてこの表示 |
+| 完了 | 🐣 + 「終わったよ！」+ project名 | root Stop の後 20 秒間その作業が再開されなかった (3回ピョコピョコ・通知音1回・約5秒後に Idle) |
+
+**「未完了」表示は無い。** 完了と言い切れない停止は何も出さずに Idle へ戻る。
 
 表示中の session には **provider + model** の 1 行が付く (`Claude · Opus 4.6` /
 `Codex · GPT-5.6-codex`)。model を取れないときは provider だけ。
 同行の右端の **`+N`** は「他に動いている session 数」で、
 Working / Finalizing / Waiting の session だけを数える (0 なら非表示)。
 
-Working 中に最近の実 tool activity を観測すると「**● 活動中**」(緑) が添えられる。
-これは進捗率ではなく「Claude が実際に動いている」ことだけを示す
-(進捗%が動かない時間でも stuck ではないと分かる)。最後の activity から15秒で自動消灯。
+確認要求 UI・警告音・activity indicator は廃止した。音が鳴るのは完了時の 1 回だけ。
 
 ## 主な特徴
 
 - Native Win32 (C# P/Invoke)。**Electron / WebView / Node 常駐 / localhost サーバー / DB 一切なし**
 - 完全 event-driven (Claude Code 公式 Hooks 連携)。polling なし。アイドル時は `GetMessage` でブロック
 - 背景完全透過・枠なし・タスクバー/Alt+Tab 非表示・常に最前面
+  (通常ウィンドウより前。OS に topmost を剥がされても表示更新時に自動復帰)
 - **クリック透過**: キャラの背後にある VS Code や Chrome をそのまま操作できる
+- **通知領域 (system tray) の 🐥 アイコン**から 表示 / 隠す / 最前面に戻す / 終了 を操作
 - 依頼全体の推定進捗表示 (新 Task システム / TodoWrite の両対応)
-- 完了 / 未完 / 判定不能を区別する誠実な完了通知
+- 進捗と完了判定は完全に独立 (進捗 % は plan から、完了は Stop + 静穏から)
 - 複数セッションの同時追跡 (優先度付き表示)
 - 別の Claude セッションのツール内から起動された子 Claude (`claude -p` 等) の通知抑制
 - Subagent 完了の誤通知防止
@@ -47,7 +47,7 @@ Working 中に最近の実 tool activity を観測すると「**● 活動中**�
 | 待機時 Private Working Set | 約 13.5 MB (起動直後) 〜 17 MB (多数の進捗描画後の定常値・増加停止確認済み) |
 | 待機時 CPU (60秒計測) | ほぼ 0 ms (イベント無し時は完全 0%) |
 | 待機時 GPU | 0 (GPU エンジンインスタンス自体が0個) |
-| Working / Waiting 表示中 | Idle と同じ (静止ビットマップ、タイマーなし)。イベント到着時だけ瞬間再描画 |
+| 作業中表示中 | Idle と同じ (静止ビットマップ、タイマーなし)。イベント到着時だけ瞬間再描画 |
 | アニメーション1回の CPU 累計 | 約 15〜50 ms |
 | Hook helper 1回 | 約 60〜70 ms で起動〜終了 (async のため Claude Code を待たせない)。残留プロセスなし |
 | GDI / USER / ハンドル | 大量イベント後も一定 (リークなし) |
@@ -87,6 +87,8 @@ ClaudePet.exe         … 同じ常駐ペット。provider + session + turn で�
 
 - 実装: C# (P/Invoke による純 Win32)。**.NET Framework 4.8 同梱の csc.exe でビルドするため追加インストール不要**
 - タイマーはアニメーション・grace・表示期限の one-shot のみ。常時タイマーなし
+- 通知領域アイコンは `Shell_NotifyIcon` (純 Win32)。アイコン画像も実行時に
+  System.Drawing で描く (外部画像ファイルなし)。taskbar ボタンや Alt+Tab には出ない
 - ペット未起動時は Stop / UserPromptSubmit / permission_prompt で自動起動 (高頻度な PostToolUse では起動しない)
 - **Prompt 本文・応答本文・ソースコードを送信・解析して進捗を推定しているわけではない**。
   扱うのは Hook が配る構造化 status metadata のみ
@@ -96,18 +98,28 @@ ClaudePet.exe         … 同じ常駐ペット。provider + session + turn で�
 「依頼 (Request)」= そのセッションで最後に `UserPromptSubmit` が来てから Stop までの1ターン。
 新しい依頼が始まると前回依頼の進捗はリセットされる。
 
-Claude がタスクリストを使って作業しているときだけ、Working ピルに
-progress bar と「**全体 推定 N%**」を表示する。Task 件数 (3/5 等) は UI に出さない。
+表示される % は「**最初に投げた依頼全体が、工程表のどこまで進んだか**」の推定であって、
+**今実行中の 1 タスクの進捗ではない**。structured plan/task を
+「依頼完了までの工程表」とみなし、その全工程の status から計算する。
 
-- **「推定」であって精密な実進捗ではない**。「現在 Claude 自身が認識している Task 群」に対する
-  structured status ベースの heuristic
-- **ETA ではない**。残り時間の予測は一切しない
+例: 「completion ロジックを変更して、テストして、docs も更新して」という依頼なら、
+plan は「現状確認 / 実装 / UI 調整 / 回帰確認 / テスト追加 / 全 suite 実行 /
+build 確認 / docs 更新」のように依頼全体を分解したものになる。この 8 工程から % を出す。
+「今このファイルを編集中」だけを plan にすると、それは依頼全体の進捗にならない。
+
 - 計算式: `(completed + 0.5 × in_progress) ÷ total × 100` (小数切り捨て)。
-  in_progress は「着手済み」として半分だけ加点する
-- **Claude が途中でタスクを追加すると全体推定が下がる場合がある** (総仕事量の認識が増えたため。バグではない)
-- 100% になっても Stop が来るまでは「作業中…」のまま。Task 完了率と turn 完了は別物
-- **タスクリストを使わない依頼では進捗は表示されない**。経過時間やツール実行回数から進捗を捏造することはしない
-- 「● 活動中」インジケータは進捗値に一切影響しない
+  in_progress は **「工程表の中の 1 工程が進行中なので 0.5 工程ぶん」** として数える。
+  「その工程自体が 50% 終わった」という意味ではない
+- **valid total >= 2 のときだけ % を出す**。total=1 の plan は「今やっている 1 個」でしかなく
+  依頼全体の進捗としての根拠が弱いので % を表示しない (tracker 自体は保持する)
+- total <= 0 (tracker なし / 空 / 解析不能) でも % は出さない。
+  経過時間やツール実行回数から進捗を捏造することはしない
+- **ETA ではない**。残り時間の予測は一切しない
+- **途中で工程が増えると % が下がることがある**。これは嘘ではなく
+  「依頼全体の見積もりが更新された」結果なので、単調増加させるための補正はしない
+- Task 件数 (3/5 等) は UI に出さない
+- **進捗は完了判定に一切関与しない**。100% でも Stop が無ければ完了しないし、
+  50% でも Stop + 静穏があれば完了する
 
 進捗のデータ源は2系統:
 
@@ -122,35 +134,75 @@ progress bar と「**全体 推定 N%**」を表示する。Task 件数 (3/5 等
 
 ### 完了判定 (Completion semantics)
 
-「終わったよ！」は「**ユーザーが投げた依頼全体が完了した**」ときだけ出す。
-
-Claude は **Stop を受けたら必ず約 2 秒待ち**、遅れて届く structured event が
-ないことを確かめてから完了通知する (hook が async なため、Stop より前に
-発生した Task/Todo イベントが Stop の後から届くことがある)。
-grace 中に関連イベントが来たら、そこからまた 2 秒静かになるまで待つ。
+完了判定は **root Stop + 20 秒の静穏 (`CompletionQuietMs`) だけ**で決まる。
+provider 共通で、Claude も Codex も同じ 20 秒を使う。
 
 ```
-Stop 受信
-  └─ 常に Finalizing (約2秒の quiet grace。UI は作業中のまま)
-        ├─ grace 中の関連イベントで grace を数え直す (100% になってもその場では通知しない)
-        └─ grace 満了
-              ├─ 全件 completed (または Task の無い依頼) → 終わったよ！
-              ├─ 未着手 (pending) Task が残る → 途中で止まったよ (明確に未完)
-              └─ 残りが in_progress のみ → 終わったか確認してね (断定しない)
+root Stop 受信
+  └─ completion candidate。UI は「作業中…」のまま (進捗 % もそのまま)
+        ├─ 20 秒以内に作業継続イベント → candidate 取消。Working へ戻る
+        │    (次に完了できるのは新しい Stop が来てから)
+        ├─ 20 秒以内に Stop 再受信     → 最新 Stop から 20 秒を数え直す
+        ├─ 20 秒以内に新しい依頼        → 古い candidate は破棄。新しい作業を表示
+        └─ 20 秒静穏で満了
+              ├─ 他に動いている session が無い → 終わったよ！ (音1回・約5秒後に Idle)
+              └─ 他に動いている session がある → 通知を出さずに片付ける (音も無し・再キューもしない)
 ```
 
-- grace window は async hook の到着順ゆれを吸収するための一時 one-shot timer
+**`終わったよ！` の意味**は「成果物が数学的に 100% 正しい」ではない。
+Pet が prompt / 応答 / 成果物本文を読まずに判定できる範囲での
+
+> **Claude Code / Codex が root Stop を出し、その後 20 秒間その作業を再開しなかった**
+
+という事実だけを表す。
+
+- **structured tracker は完了の証拠にしない**。進捗の推定材料にすぎない。
+  94% でも / pending が残っていても / tracker が壊れていても / tracker が無くても、
+  Stop + 20 秒静穏なら完了として通知する
+- 逆に **100% でも Stop が来なければ完了しない**。interrupt のように Stop が
+  来ないケースでは推測 timeout で完了させない
+- **SessionEnd 単体は完了の根拠にしない**。Stop 済みの session なら SessionEnd が
+  来ても candidate を維持し、Stop なしの SessionEnd では静かに片付けて Idle に戻る
+- 「作業継続イベント」= Claude なら PostToolUse / Task 系 / TodoWrite / permission、
+  Codex なら同一 turn の PostToolUse / update_plan / PermissionRequest /
+  SubagentStart / SubagentStop。Codex の **old-turn の遅延イベントは current turn の
+  candidate を取消さない** (provider + session + turn の分離は維持)
+- 同一依頼への重複 Stop / 遅延イベントでも通知は1回だけ (debounce + tombstone)
 - **Task の削除/キャンセル (`TaskUpdate` status=deleted/cancelled) には対応する hook が発火しない**
-  (実測)。PostToolUse から検知して total から除外する (これを怠ると「完了したのに
-  途中で止まったよ」という false incomplete になる)
-- Task の無い依頼: 2 秒静穏の間に structured event が一つも来なければ
-  Stop を完了として扱う
-- 逆に **Todo / Task / update_plan を一度でも使った依頼**では、status を読めなかった
-  場合でも「task なし依頼」へ格下げせず、全件 completed を確認できない限り
-  「終わったよ！」は出さない
-- 同一依頼への重複 Stop / 遅延イベントでは celebration は1回だけ (debounce + tombstone)
-- StoppedIncomplete / Indeterminate は次の依頼 (UserPromptSubmit) で解除。終了済み
-  セッションが表示を塞ぎ続けないよう最大10分で自動消滅
+  (実測)。PostToolUse から検知して total から除外する (これを怠ると進捗 % が下振れする)
+
+> **旧仕様 (現在は無効)**: 以前は Claude 2 秒 / Codex 5 秒の grace で
+> 「structured task 全件 completed」を確認できたときだけ完了とし、
+> それ以外を「未完了」表示にしていた。20 秒静穏方式へ置き換えたため、
+> 2 秒 / 5 秒の grace も「未完了」UI も現在は存在しない。
+
+### 最前面表示と通知領域 (tray)
+
+Pet は**通常のアプリウィンドウより常に前面** (TOPMOST) に表示される。
+ただし focus は決して奪わない: クリック透過 + `WS_EX_NOACTIVATE` なので、
+VS Code で入力中に Pet の表示が切り替わっても入力先は変わらない。
+
+`WS_EX_TOPMOST` は作成時の一度きりでは不十分で、fullscreen アプリや
+Win+D、secure desktop 遷移などで OS が topmost band から外すことがある
+(実運用で VS Code の背面へ回る現象を確認)。Pet は**表示内容が実際に
+変わったとき**に `HWND_TOPMOST + SWP_NOACTIVATE` で Z-order を再保証する
+(event-driven のみ。polling も常時タイマーも増やしていない)。
+
+他の TOPMOST アプリとは Windows 標準の前後関係になる。押しのけ続けるような
+争いはしないので、隠れた場合は tray の「最前面に戻す」で復帰させる。
+
+通知領域の 🐥 アイコン:
+
+| 操作 | 動作 |
+|---|---|
+| 左クリック | 最前面へ復帰 (hidden なら再表示 + 最新 state 描画 + 最前面) |
+| 右クリック | menu: ヒヨコを表示 / ヒヨコを隠す / 最前面に戻す / ClaudePetを終了 |
+
+「ヒヨコを隠す」は **visual hide** であって監視停止ではない。hidden 中も
+hooks 受信・進捗更新・完了判定・session 管理はすべて継続し、再表示した
+瞬間にその時点の最新 state を描く (過去の通知は再生しない)。
+ユーザーが意図的に消しているため、**hidden 中は完了音も鳴らさない**。
+tray の追加に失敗しても Pet 本体は通常動作する (fail-soft)。
 
 ### Nested 子 Claude の通知抑制
 
@@ -166,11 +218,18 @@ Stop 受信
 
 内部状態は session_id 単位で分離。表示はペット1匹で、priority は
 
-**Waiting / StoppedIncomplete / Indeterminate > Celebrating > Working > Idle**、
+**Working / Waiting / Finalizing (= 動いている作業) > 終わったよ！ > Idle**、
 同 priority なら最新イベントのセッション。
 
-例: `project-a` が Waiting、`project-b` が Working なら「確認して！project-a」を表示し、
-project-a が解消 (承認して作業再開 or 完了) すると「作業中…project-b」へ自動で戻る。
+過去の完了通知が今動いている作業を隠さないことを最優先している。
+
+- 完了通知を出すのは、静穏が満了した瞬間に**他に active な session が無いとき**だけ。
+  他に動いていれば通知そのものを省略する (音も鳴らさず、後から再キューもしない)
+- 通知中に新しい作業が始まれば、その場で作業表示へ切り替わる
+- `+N` が数える active は Working / Waiting / Finalizing。
+  Stop 後の静穏待ちはユーザーから見て「作業中…」なので active に含める。
+  完了通知中の session と metadata だけの session は数えない
+- Waiting の描画は「作業中…」と同じ (確認要求 UI は出さない)
 
 - セッションテーブルは最大8件。超過時は最古を削除。4時間イベントの無いセッションも削除
 - 全て in-memory。永続化なし
@@ -184,8 +243,7 @@ project-a が解消 (承認して作業再開 or 完了) すると「作業中�
 ## Codex 対応
 
 Claude Code と同じペット・同じ UI で Codex の状態も見られる。
-Codex 専用の画面は追加していない (Working / 進捗 / 確認して！/
-終わったよ！/ 途中で止まったよ をそのまま使う)。
+Codex 専用の画面は追加していない (作業中… / 終わったよ！をそのまま使う)。
 
 ### Setup
 
@@ -211,7 +269,7 @@ pwsh -File install-codex-hook.ps1           # 実際に追記
 |---|---|---|---|
 | `UserPromptSubmit` | なし | sync | 新 turn 登録 / 依頼リセット |
 | `PostToolUse` | `.*` | async | activity 表示・`update_plan` 進捗 |
-| `PermissionRequest` | `.*` | sync | 確認して！ |
+| `PermissionRequest` | `.*` | sync | 完了候補取消 (確認 UI は出さない) |
 | `Stop` | なし | sync | 完了候補 (5 秒 grace 開始) |
 | `SessionEnd` | なし | sync | 後片付け |
 | `SubagentStart` / `SubagentStop` | なし | sync | subagent 検知 (完了にはしない) |
@@ -234,10 +292,10 @@ async はあくまで性能最適化であり、sync になっても正しさは
 
 - **Codex の `Stop` は完了確定ではない。** 別の hook が continuation を返すと
   同じ turn のまま作業が続き、もう一度 `Stop` が来る (実測)。
-  よって `Stop` は「完了候補」として扱い、**静穏 5 秒**で確定する。
-  grace 中に同じ turn の作業イベントが来たら候補を破棄し、
-  2 回目の `Stop` なら 5 秒を最初から数え直す。
-  (Claude 側の約 2 秒 Finalizing とは別理由・別定数。互いに影響しない)
+  よって `Stop` は「完了候補」として扱い、**静穏 20 秒** (`CompletionQuietMs`) で確定する。
+  静穏中に同じ turn の作業イベントが来たら候補を破棄し、
+  2 回目の `Stop` なら 20 秒を最初から数え直す。
+  (この静穏は Claude と共通。旧仕様では Codex 5 秒 / Claude 2 秒と別値だった)
 - **interrupt (途中停止) では完了通知を出さない。**
   interrupt では `Stop` も `SessionEnd` も発火しない (実測) ので、
   完了候補自体が作られず「終わったよ！」の誤通知は構造的に起きない。
@@ -309,8 +367,8 @@ Claude 側と Codex 側は独立していて、片方だけ入れても動く。
 |---|---|---|
 | `Stop` | なし | 完了通知 |
 | `UserPromptSubmit` | なし | Working 開始 / 依頼リセット |
-| `Notification` | `permission_prompt` | 確認して！ (idle_prompt 等は発火させない) |
-| `PostToolUse` | `*` | 活動表示・Waiting 解除・Task/Todo 進捗 |
+| `Notification` | `permission_prompt` | 受信のみ (確認 UI は出さない) |
+| `PostToolUse` | `*` | Waiting 解除・Task/Todo 進捗・grace 再起動 |
 | `SessionStart` | なし | model 表示用 metadata (これだけでは作業中にしない) |
 | `SessionEnd` | なし | セッション後片付け |
 | `TaskCreated` | なし | Task 進捗 |
@@ -353,15 +411,25 @@ Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$e
 ## Limitations
 
 - 進捗はあくまで heuristic。Claude がタスクリストを整理し直すと数字が前後する
-- Task を使わない依頼では Stop ベースの完了判定になる (短い応答でも「終わったよ！」)。
-  ただし Claude では遅延 event を待つため通知が約 2 秒遅れる
-- 2 秒を超えてから届く Claude の async event までは司れない (bounded)
-- 完了判定は Claude 自身の task lifecycle (status 更新) に依存する。grace (約2秒) を超える
-  極端な async 遅延では「終わったか確認してね」になることがある
+- **完了通知は「作業が止まった」ことの通知であって、成果物の正しさの保証ではない**
+- **plan を使わない依頼では % が出ない**。完了通知自体は plan なしでも出る
+- **total=1 の plan では % が出ない**。依頼全体を表す plan を作る運用とセット
+- **Stop の 20 秒後まで完了通知は出ない**。速報性より false positive の回避を優先している
+- **Stop 後 20 秒以内に届いた遅延イベントは「作業継続」とみなして candidate を取消す**。
+  Claude の hook は async なので、Stop より前に発生したイベントが Stop の後から
+  届いた場合も取消しになる。その turn は次の Stop が来るまで完了通知されない
+  (誤って「終わったよ！」を出すより、出さない方を選んでいる)
+- **完了通知は他に動いている session があると出ない**。まとめて再通知もしない
+- 完了通知は約5秒で消えるため、画面から目を離していると見逃す
+- **他の TOPMOST アプリには隠れることがある** (TOPMOST 同士は通常の前後関係)。
+  tray の「最前面に戻す」か、次の表示更新の自動再保証で復帰する
+- tray menu を開いた瞬間だけ Windows 標準の foreground 処理が入る
+  (menu を外側クリックで閉じるために必要)。Pet はクリック透過なので
+  その後の入力を奪い続けることはない
 - nested 検出の限界: 子 Claude を起動した中間シェルが先に終了するとチェーンが切れて
   検出できない場合がある。exe 名が claude でない起動形態 (node 経由等) も検出不可
 - `Stop` は「応答完了」ごとに発火する仕様のため、会話的なやり取りでも通知される
-- permission 待ち (Waiting) の発火は対話セッションのみ
+- permission 待ちは内部 state としてのみ扱い、確認 UI は表示しない
 - マルチモニタ: プライマリモニタの右下固定。モニタ構成変更後はペット再起動が必要
 - DPI はシステム DPI 基準 (セッション中の DPI 変更には追従しない)
 - キャラはコード描画のひよこ (`src/Pet.cs` の `PetRenderer` 差し替えで変更可能)

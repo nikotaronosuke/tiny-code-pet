@@ -88,7 +88,11 @@ PostToolUse(TodoWrite) の status 件数スナップショット。同一依頼�
 - ツール側でのグローバル強制は**却下**。README に「滑らかな進捗が欲しい
   長時間依頼では自分のプロンプトに付ける」opt-in レシピとしてのみ記載。
 
-## Completion reconciliation
+## Completion reconciliation (旧仕様の経緯)
+
+> **注意: この節は履歴。** 現在の完了判定は
+> 「root Stop + 20 秒静穏」だけで、structured tracker は完了判定に使わない。
+> 最新仕様は後述の「completion = root Stop + 20 秒静穏」を参照。
 
 「終わったよ！」の false positive / false negative を潰した経緯:
 
@@ -164,7 +168,154 @@ marker でも、正常な snapshot でも true になり、**`ResetRequest()`
 - Codex では subagent 抑制中の update_plan でも観測事実は残す
   (progress へは適用しないまま)。
 
-## Claude の quiet grace (root Stop は常に 2 秒)
+## 完全 auto 運用向けの表示簡素化と厳格 completion (2026-08)
+
+ユーザーは Claude Code / Codex を完全 auto で使う。知りたいのは
+「本当に完了したか」と「今何%か」だけなので、表示を 3 種類へ絞った。
+
+### visible state は 3 種類
+
+| 表示 | 内部 state |
+|---|---|
+| Idle | (表示候補なし) |
+| 作業中… | Working / Waiting / Finalizing |
+| 終わったよ！ | Celebrating |
+
+内部 state は既存 event 互換のために残し、描画だけ統合した。
+廃止した表示: 「確認して！」「終わったか確認してね」「途中で止まったよ」
+「● 活動中」、そして「未完了」。警告音と軽バウンドも廃止 (音は完了時の 1 回だけ)。
+ユーザー操作を要求する UI は出さない。
+
+### taskless fallback の廃止 (厳格 completion) — 旧仕様
+
+> **注意: この節は履歴。** 「structured task 全件 completed」を完了の必須条件に
+> していた時期の記録。現在は tracker と completion を完全に分離した
+> (後述「completion = root Stop + 20 秒静穏」)。
+
+以前は「structured task を観測していない依頼は Stop を完了根拠にする」
+fallback があり、それを一度廃止して「tracker で全件 completed を確認できた
+ときだけ完了」という厳格版にした。task なし / total=0 / 解析不能 /
+pending 残 / in_progress 残 / interrupt / subagent はすべて「未完了」表示だった。
+
+この方式は完了通知の確実性を **依頼側の運用 (毎回 structured task を作る)** に
+依存させていた。運用を守れないと完了通知が出ず、逆に status を先に completed へ
+倒すと嘘の完了が出る、という構造的な弱さがあった。
+
+### 「未完了」表示の廃止 — 旧仕様の終着点
+
+「未完了」は最初は次の依頼まで出しっぱなし、次に約5秒の一時通知
+(`NoticeDueUtc` + `TimerNotice`) へ変え、最終的に**表示そのものを廃止**した。
+
+- 永続表示は、終わった作業の結果が今動いている作業より長く画面を占有する
+- 一時通知にしても、伝えている内容が「Pet が完了を確認できなかった」という
+  **ツール内部の都合**でしかなく、ユーザーが取れる行動が無い
+- 完了判定を tracker から切り離した結果、「未完了」に相当する状態自体が
+  無くなった (完了でなければ、まだ作業中か Idle のどちらか)
+
+関連コード (`StoppedIncomplete` / `Indeterminate` / `NoticeDueUtc` /
+`TimerNotice` / `RenderIncomplete` / `IncompleteNoticeTtl`) はすべて削除した。
+
+
+## completion = root Stop + 20 秒静穏 (現在の仕様, 2026-08)
+
+### progress と completion を完全に分離した
+
+それまでは structured tracker が両方を担っていた。
+
+- progress: 「依頼全体の工程表のどこまで進んだか」の推定材料 (今も同じ)
+- completion: 「全件 completed を確認できたか」の判定材料 (**廃止**)
+
+tracker を完了の証拠に使うと、agent 側の status 運用の質がそのまま
+通知の正しさになる。status を先に倒せば嘘の完了が出るし、
+運用を守れなければ完了通知が出ない。どちらも Pet 側では検証できない。
+
+現在は完了判定に tracker を一切使わない。`FinalizeDue` は
+`GetProgress` / `SawStructuredTasks` / `SnapTotal` を読まない
+(この不変条件はテストで固定している)。
+
+### completion の定義
+
+**root Stop を受け、その後 `CompletionQuietMs` = 20 秒のあいだ
+その作業が再開されなかった。** これだけ。
+
+これは「成果物が正しい」という意味ではなく、prompt / 応答 / 成果物本文を
+読まない Pet が観測できる範囲での「一連の作業の終了」でしかない。
+この意味を README にも明記している。
+
+- 94% でも / pending が残っていても / tracker が壊れていても /
+  tracker が無くても、Stop + 20 秒静穏なら完了通知する
+- 100% でも Stop が無ければ完了しない。interrupt で Stop が来ない
+  ケースを推測 timeout で完了させない方針は維持
+- SessionEnd 単体は完了の根拠にしない。Stop 済みなら SessionEnd が来ても
+  candidate を維持し、Stop なしの SessionEnd は静かに片付けて Idle へ戻る
+
+### 継続イベントは「延長」ではなく「取消」
+
+旧 grace は継続イベントで deadline を**延長**していた。20 秒方式では
+**candidate を破棄して Working へ戻す**。次に完了できるのは新しい root Stop
+が来てからになる。
+
+延長のままだと「作業が止まってから 20 秒」ではなく
+「最後のイベントから 20 秒」になり、interrupt 後の残イベントで
+勝手に完了してしまう。Codex 側は元々この取消方式だったので、
+Claude 側をそれに合わせて統一した。
+
+**既知のトレードオフ**: Claude の hook は async なので、Stop より前に発生した
+Task/Todo イベントが Stop の後から届くと、それも継続とみなして candidate が
+消える。その turn は次の Stop まで完了通知されない。誤って
+「終わったよ！」を出すより出さない方を選んでいる (false negative 優先)。
+
+### 2 秒 / 5 秒 grace の統合
+
+Claude の 2 秒と Codex の 5 秒は、もともと「別の理由による別の値」だった。
+20 秒 quiet window はどちらの理由も包含し、意味が完全に同じになったので
+1 つの定数・1 つのフィールド (`QuietDueUtc`)・1 本の timer (`TimerQuiet`) へ
+統合した。中途半端に旧定数を残さず削除している。
+
+統合したのは deadline 管理だけで、以下は provider ごとに分けたまま:
+
+- Claude と Codex の state 遷移 (`OnEvent` / `OnCodexEvent`)
+- Codex の turn 分離。old-turn の遅延イベントは current turn の candidate を
+  取消さない (実測 18.6 秒遅延あり)
+- Codex の subagent fail-closed (progress のみ無効化)
+- MetadataOnly quarantine (tombstone)
+
+### 他に active があれば完了通知を出さない
+
+満了時に他の active session があれば、`終わったよ！` を出さずに
+その session を静かに片付ける (音も鳴らさない・後から再キューもしない)。
+
+完全 auto 運用では、終わった作業の通知より今動いている作業の表示の方が
+価値が高い。表示 priority を active 優先にするだけでは不十分で、
+「他が動いていない瞬間」を狙って通知が割り込むのを防ぐ必要があった。
+
+同時に満了した場合は LastSeq の古い方から処理する。先に見る側からは
+残りがまだ active に見えるので、通知が残るのは最新の作業になる。
+
+### 表示 priority
+
+**active (Working / Waiting / Finalizing) > Celebrating**。
+Celebrating を active より下に置くことで、通知中に新しい作業が始まったら
+その場で作業表示へ切り替わる。過去の完了で現在の作業を隠さない。
+
+`+N` が数える active には Finalizing (Stop 後の静穏待ち) を含める。
+ユーザーから見て「作業中…」と表示されている以上、active として数えるのが自然。
+
+### total=1 の plan では % を出さない
+
+`MinProgressTotal = 2`。1 工程だけの plan は「今やっている 1 個」でしかなく、
+依頼全体の進捗としての根拠が弱い。50% と出すと誤解を招くので % を出さない。
+tracker 自体は保持するので、plan が 2 工程以上に育てば % が出る。
+
+plan が増えて % が下がることは許容する。単調増加させるための補正や
+stale な高値の固定はしない (truthful を優先)。
+
+## Claude の quiet grace (旧仕様: root Stop は常に 2 秒)
+
+> **注意: この節は履歴。** Claude 2 秒 / Codex 5 秒の grace は
+> provider 共通の 20 秒 quiet window (`CompletionQuietMs`) へ統合された。
+> 「root Stop は必ず quiet window へ入る」「完了を決めるのは満了時の
+> `FinalizeDue` だけ」という考え方はそのまま残っている。
 
 ### 常に grace へ入る
 
@@ -204,15 +355,16 @@ grace 中に 100% になっても「終わったよ！」を出さない。
 **最終的な completion を決められるのは quiet grace 満了後の `FinalizeDue` だけ**。
 以前あった「Finalizing 中に全完了になった瞬間 Celebrating」は廃止した。
 
-### 判定 (両 provider 共通の FinalizeDue)
+### 判定 (旧仕様)
 
-| 状態 | 結果 |
+| 状態 | 結果 (表示) |
 |---|---|
-| total > 0 かつ done >= total | Celebrating |
-| total > 0 で pending が残る | StoppedIncomplete |
-| total > 0 で残りが in_progress のみ | Indeterminate |
-| total <= 0 で SawStructuredTasks | Indeterminate (格下げしない) |
-| total <= 0 で tracker 未観測 | Celebrating (従来の Stop ベース) |
+| total > 0 かつ done >= total | Celebrating (終わったよ！) |
+| total > 0 で pending が残る | StoppedIncomplete (未完了) |
+| total > 0 で残りが in_progress のみ | Indeterminate (未完了) |
+| total <= 0 (tracker なし / 解析不能含む) | Indeterminate (未完了) |
+
+この表は現在無効。今の `FinalizeDue` は tracker を一切見ない。
 
 ### bounded limitation
 
@@ -308,6 +460,63 @@ evict された session から後で UserPromptSubmit が来たら通常の Work
 provider / model / session count は **表示だけの情報**で、
 完了判定 (quiet grace / structured tracker / FinalizeDue) には一切関与しない。
 
+## TOPMOST 再保証と通知領域アイコン (2026-08)
+
+### WS_EX_TOPMOST だけでは背面へ回る
+
+実運用で「最初は VS Code より前面 → いつの間にか背面」という現象を確認した。
+原因は、TOPMOST の指定が **CreateWindowEx の一度きり**だったこと。
+
+- `MoveTo` (bounce の 30ms tick) は `SWP_NOZORDER` で Z-order を触らない
+- `UpdateLayeredWindow` も Z-order を変えない
+- つまり一度 topmost band から外れると、二度と戻る経路が無かった
+
+OS が topmost を剥がすのは fullscreen アプリの遷移・Win+D・secure desktop
+などで正常に起こり得る。修正は「剥がされない」ことではなく
+「剥がされても次の機会に戻る」こと。
+
+### EnsureTopmost (event-driven のみ)
+
+`SetWindowPos(HWND_TOPMOST, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)` を
+
+- 表示内容が実際に変わった再描画のとき (render key が変わったときだけなので自然に debounce される)
+- 明示的な Show / 最前面に戻す / tray 左クリック
+
+でのみ呼ぶ。polling・常時タイマー・bounce 毎 tick の再 assert はしない。
+`MoveTo` は従来どおり `SWP_NOZORDER` のまま (位置と Z-order の責務を分離)。
+
+他の TOPMOST アプリと押しのけ合う実装 (foreground hook 等) は不採用。
+TOPMOST 同士は Windows 標準の前後関係とし、隠れたら tray から復帰させる。
+
+### 通知領域アイコン (Shell_NotifyIcon)
+
+- taskbar ボタンは出さない方針 (`WS_EX_TOOLWINDOW`) は維持したまま、
+  管理用の入口を tray に 1 つ置く。WinForms NotifyIcon / 別常駐 helper は不採用
+  (純 Win32 P/Invoke、既存の GetMessage loop に WM_APP+1 callback を足すだけ)
+- アイコンは PetRenderer と同じ配色でひよこを実行時描画し `GetHicon()`。
+  外部画像ファイルを増やさない。`DestroyIcon` で解放
+- menu は `TrackPopupMenuEx` + 事前 `SetForegroundWindow` + 事後 `WM_NULL` の
+  標準 tray パターン。Pet window は click-through + NOACTIVATE なので
+  menu 後に入力を奪い続けることはない
+- menu 選択は `WM_COMMAND` で届く (TPM_RETURNCMD 不使用)。テストが同じ
+  message を post して同一経路を検証できる
+- NOTIFYICONDATA は V1 (szTip まで) レイアウト。バルーンや version 4 の
+  機能は使わないため
+- 追加失敗は fail-soft: tray が無くても Pet 本体は通常動作
+- Explorer 再起動での tray icon 復元 (TaskbarCreated) は今回のスコープ外
+
+### 「ヒヨコを隠す」= visual hide
+
+hide しても process・HWND・mutex・session 管理・hooks 受信・完了判定は
+すべて継続する。止めるのは描画 (`RenderCurrent` が early return) と完了音だけ。
+
+- 再表示時は force 描画でその時点の最新 state に追いつく。
+  hidden 中に起きた完了の音や bounce を後から再生することはしない
+- hidden 中の完了でも Celebrating エントリは通常と同じ寿命で片付ける
+  (TimerRevert を直接張る)。再表示した時に過去の完了通知が残らない
+- 「hidden だから別 helper を立てる」ことはしない。増える state は
+  bool 1 つ + tray handle だけ
+
 ## Nested Claude suppression
 
 - Claude のツール内から `claude -p` 等で起動された子 Claude の hook が
@@ -329,13 +538,13 @@ provider / model / session count は **表示だけの情報**で、
   は発火しない (実測)。防御として agent_id 付き Stop / TaskCreated /
   TaskCompleted も通知・集計しない。
 
-## Activity indicator
+## Activity indicator (廃止)
 
-- 進捗 % が動かない時間帯に「stuck では?」と不安になる問題への回答。
-- PostToolUse 等の**実 activity** を観測したときだけ「● 活動中」(緑) を表示。
-- TTL 15 秒 (`ActivityTtl`)。消灯は one-shot timer (常時 timer にしない)。
-- **progress 値には一切影響させない**。「% が止まっていても Claude は
-  動いている」ことだけを伝える表示で、進捗と混ぜると両方の意味が壊れる。
+かつては PostToolUse 観測時に「● 活動中」(TTL 15 秒) を表示していたが、
+完全 auto 運用への簡素化で廃止した。表示専用だった
+`LastActivityUtc` / `ActivityTtl` / `TimerActivity` / `OnActivityExpire` も削除。
+PostToolUse 自体は Waiting 解除・structured tracker・quiet grace 再起動・
+Codex completion candidate 取消に今も必須で、event 処理は残している。
 
 ## Multi-session
 
@@ -445,7 +654,7 @@ Codex Hooks       -> CodexPetNotify.exe  -> WM_COPYDATA (dwData 20-27) -┘
 | 21 | PostToolUse | tool activity | - |
 | 22 | PostToolUse(update_plan) | plan snapshot | `c/i/t` |
 | 23 | PermissionRequest | 確認して！ | - |
-| 24 | Stop | completion candidate (5 秒 quiet grace) | - |
+| 24 | Stop | completion candidate (quiet window) | - |
 | 25 | SessionEnd | 後片付け | - |
 | 26 | SubagentStart | その turn を「subagent 含む」と mark | - |
 | 27 | SubagentStop | mark 維持 (root completion にはしない) | - |
@@ -468,7 +677,7 @@ update_plan 専用の PostToolUse を追加登録すると同一 tool で helper
   status を 1 つも取れなければ snapshot を送らず単なる activity として扱う。
   捏造せず、次の snapshot で自己修復する。本文や経過時間で補完しない。
 
-### Codex の Stop は完了確定ではない -> 5 秒 quiet grace
+### Codex の Stop は完了確定ではない -> quiet window
 
 実測 (Phase C):
 
@@ -479,15 +688,19 @@ update_plan 専用の PostToolUse を追加登録すると同一 tool で helper
   **true でも「今回が最終 Stop」を保証しない**ので判定に使わない。
 - Stop は rollout の `task_complete` より約 130〜165 ms 早い。
 
-よって Codex では **Stop = completion candidate**、静穏 5 秒
-(`CodexQuietGraceMs = 5000`) で確定する。grace 中に同一 turn の
-PostToolUse / update_plan / PermissionRequest が来たら candidate を破棄し、
-2 回目の Stop が来たら 5 秒を最初から数え直す。
+よって Codex では **Stop = completion candidate**、静穏
+(`CompletionQuietMs = 20000`) で確定する。静穏中に同一 turn の
+PostToolUse / update_plan / PermissionRequest / SubagentStart / SubagentStop が
+来たら candidate を破棄し、2 回目の Stop が来たら 20 秒を最初から数え直す。
 
-**Claude の Finalizing 約 2 秒 (`FinalizeGraceMs = 2000`) とは別物。**
-Claude 側は「async hook の到着順ゆれを吸収する」ためのもので、Codex 側は
-「Stop の後に continuation があり得る」ためのもの。理由も値も別で、
-片方を変えてももう片方に影響しないよう timer / 定数 / 判定経路を分離している。
+この「Stop の後に continuation があり得る」という理由は今も有効で、
+Claude 側の「async hook の到着順ゆれを吸収する」という理由と合わせて
+20 秒の quiet window が両方を包含している。
+
+> **旧仕様**: Codex 5 秒 (`CodexQuietGraceMs`) / Claude 2 秒 (`FinalizeGraceMs`) と
+> 別値・別 timer・別判定経路だった。意味が同じになったので統合した
+> (「completion = root Stop + 20 秒静穏」節)。turn 分離・subagent fail-closed・
+> old-turn 破棄といった Codex 固有の判断は分離したまま。
 
 ### progress 100% と completion は別
 
@@ -510,6 +723,8 @@ permission_mode / tool_name / tool_input / description。
   PostToolUse が来なくても Stop / 新しい UserPromptSubmit / SessionEnd で解除する。
   **PreToolUse では解除しない** (そもそも登録しない)。
 - approve / deny / cancel の区別は表示しない。permission 専用の timeout も足さない。
+- 完全 auto 運用化に伴い、確認 UI (「確認して！」) と警告音は廃止。
+  Waiting state は completion 互換のため残るが描画は「作業中…」と同じ。
 - observer は decision を返さない。allow/deny へ絶対に介入しない。
 - ordering が重要で低頻度なので sync hook にする。
 

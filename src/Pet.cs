@@ -3,23 +3,47 @@
 // 描画は System.Drawing で ARGB ビットマップを合成し UpdateLayeredWindow で反映。
 // タイマーはアニメーション中のみ SetTimer し、終了後は必ず KillTimer する。
 //
-// 状態遷移 (Claude: session_id 単位):
+// 状態遷移 (Claude: session 単位 / Codex: session + turn 単位):
 //   (なし) --UserPromptSubmit--> Working --permission_prompt--> Waiting
 //   Waiting --PostToolUse/UserPromptSubmit--> Working
-//   Working/Waiting --Stop--> Finalizing --(約2秒 quiet)--> Celebrating / 未完表示
-//   SessionEnd --> エントリ削除
+//   Working/Waiting --root Stop--> Finalizing --(20秒 quiet)--> Celebrating
+//   Finalizing --継続イベント--> Working (completion candidate を取消す)
+//   SessionEnd --> エントリ削除 (Celebrating / Finalizing 中は消さない)
 //
-// Claude の Stop は常に Finalizing へ入る。hook が async なので、Stop より前に
-// 発生した TaskCreated/TodoWrite が Stop の後から届きうるため。grace 中に関連
-// イベントが来たら静穏時間を数え直し、完了は FinalizeDue だけが決める
-// (100% になっても grace 中は「終わったよ！」を出さない)。
+// 見える状態は 3 つだけ: Idle / 作業中… / 終わったよ！。
+// 旧「incomplete」表示は廃止した。完了と判定できない停止は何も出さず Idle へ戻る。
+// 確認要求 UI・警告音・activity indicator も出さない。
+//
+// progress と completion は完全に独立している:
+//   progress   = structured plan/task の status 件数から出す「依頼全体の推定進捗」。
+//                valid total >= 2 のときだけ % を出す (1 工程だけの plan は根拠が弱い)。
+//                完了判定には一切使わない。
+//   completion = root Stop + CompletionQuietMs の静穏だけで決める。
+//                tracker の件数・完了状況は完了の証拠にしない。
+//
+// 「終わったよ！」の意味は「成果物が正しい」ではなく、
+// 「root Stop が来て、その後 20 秒間その作業が再開されなかった」。
 //
 // Codex は provider+session+turn 単位の別イベント系 (dwData 20〜27) で入ってくる。
-// Claude 側の判定・定数を共通化せず、provider 固有の最小分岐だけを持つ:
-//   Stop は即完了ではなく 5 秒 quiet grace の completion candidate
-//   (Claude の 2 秒とは別理由・別定数。docs/DESIGN_DECISIONS.md 参照)
+// quiet window の長さと deadline 管理だけ共通化し、state 遷移・turn 分離は
+// provider ごとに分けたまま (Codex の old-turn 遅延イベントを混ぜない)。
 //
-// 表示は常にペット1匹。優先度 Waiting > Celebrating > Working、同率は最新イベントの session。
+// 表示は常にペット1匹。優先度 active (Working/Waiting/Finalizing) >
+// 完了通知 (Celebrating)、同率は最新イベントの session。完了通知を出すのは
+// 満了時に他の active が無いときだけで、過去の完了で進行中の作業を隠さない。
+//
+// Z-order: 通常ウィンドウより常に前面 (TOPMOST)。ただし WS_EX_TOPMOST は
+// 作成時の一度きりでは不十分で、fullscreen 遷移等で OS が topmost band から
+// 外すことがある (実運用で確認)。表示内容が変わった時と明示操作の時だけ
+// HWND_TOPMOST + SWP_NOACTIVATE で再保証する (polling も常時 timer も無し)。
+// focus は決して奪わない (WS_EX_NOACTIVATE / click-through 維持)。
+//
+// 通知領域 (system tray) に管理アイコンを 1 つ持つ (Shell_NotifyIcon)。
+// 左クリック = 最前面へ復帰 (hidden なら再表示)。右クリック = menu
+// (表示 / 隠す / 最前面に戻す / 終了)。「隠す」は visual hide であって
+// 監視停止ではない: hooks 受信・進捗・完了判定・session 管理は継続し、
+// 再表示時にその時点の最新 state を描く。hidden 中は完了音も鳴らさない。
+// taskbar ボタンと Alt+Tab には出さない (WS_EX_TOOLWINDOW 維持)。
 //
 // C# 5 (.NET Framework 4.8 同梱 csc.exe) でビルド可能な構文のみ使用。
 
@@ -42,22 +66,43 @@ namespace ClaudePet
         public const int WS_EX_NOACTIVATE = 0x8000000;
         public const int WS_EX_TOPMOST = 0x8;
 
+        public const int WM_NULL = 0x0000;
         public const int WM_DESTROY = 0x0002;
         public const int WM_CLOSE = 0x0010;
+        public const int WM_COMMAND = 0x0111;
         public const int WM_TIMER = 0x0113;
         public const int WM_COPYDATA = 0x004A;
+        public const int WM_CONTEXTMENU = 0x007B;
+        public const int WM_LBUTTONUP = 0x0202;
+        public const int WM_RBUTTONUP = 0x0205;
 
+        public const int SW_HIDE = 0;
         public const int SW_SHOWNOACTIVATE = 4;
         public const int ULW_ALPHA = 2;
         public const byte AC_SRC_OVER = 0;
         public const byte AC_SRC_ALPHA = 1;
 
         public const int SWP_NOSIZE = 0x0001;
-        public const int SWP_NOACTIVATE = 0x0010;
+        public const int SWP_NOMOVE = 0x0002;
         public const int SWP_NOZORDER = 0x0004;
+        public const int SWP_NOACTIVATE = 0x0010;
+        public const int SWP_SHOWWINDOW = 0x0040;
+        public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
 
-        public const uint SOUND_DEFAULT = 0x00000000;      // 完了音 (既定のビープ)
-        public const uint SOUND_EXCLAMATION = 0x00000030;  // 確認待ち音 (Windows 警告音・完了音と別)
+        // ---- 通知領域 (Shell_NotifyIcon) ----
+        public const uint NIM_ADD = 0;
+        public const uint NIM_DELETE = 2;
+        public const uint NIF_MESSAGE = 0x1;
+        public const uint NIF_ICON = 0x2;
+        public const uint NIF_TIP = 0x4;
+
+        // ---- tray context menu ----
+        public const uint MF_STRING = 0x0;
+        public const uint MF_GRAYED = 0x1;
+        public const uint MF_SEPARATOR = 0x800;
+        public const uint TPM_RIGHTBUTTON = 0x2;
+
+        public const uint SOUND_DEFAULT = 0x00000000;      // 完了音 (既定のビープ)。完了時だけ鳴らす
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int x; public int y; public POINT(int ax, int ay) { x = ax; y = ay; } }
@@ -113,6 +158,21 @@ namespace ClaudePet
             public IntPtr lpData;
         }
 
+        // NOTIFYICONDATA の V1 (Win2000) レイアウト。szTip までしか使わないので
+        // それ以降のフィールドは持たない (cbSize が一致していれば shell は受理する)。
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct NOTIFYICONDATA
+        {
+            public int cbSize;
+            public IntPtr hWnd;
+            public uint uID;
+            public uint uFlags;
+            public uint uCallbackMessage;
+            public IntPtr hIcon;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string szTip;
+        }
+
         public delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -165,6 +225,34 @@ namespace ClaudePet
 
         [DllImport("user32.dll")]
         public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref RECT pvParam, uint fWinIni);
+
+        // ---- 通知領域アイコンと tray menu 用 ----
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool Shell_NotifyIcon(uint dwMessage, ref NOTIFYICONDATA lpData);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr CreatePopupMenu();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool AppendMenu(IntPtr hMenu, uint uFlags, uint uIDNewItem, string lpNewItem);
+
+        [DllImport("user32.dll")]
+        public static extern bool TrackPopupMenuEx(IntPtr hMenu, uint uFlags, int x, int y, IntPtr hWnd, IntPtr lptpm);
+
+        [DllImport("user32.dll")]
+        public static extern bool DestroyMenu(IntPtr hMenu);
+
+        [DllImport("user32.dll")]
+        public static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool DestroyIcon(IntPtr hIcon);
 
         [DllImport("user32.dll")]
         public static extern bool MessageBeep(uint uType);
@@ -239,10 +327,11 @@ namespace ClaudePet
     {
         public const int Working = 1;
         public const int Waiting = 2;
-        public const int Celebrating = 3;
-        public const int StoppedIncomplete = 4; // 明確に未完のまま停止 (「途中で止まったよ」)
-        public const int Indeterminate = 5;     // 完了とも未完とも断定できない (「終わったか確認してね」)
-        public const int Finalizing = 6;        // Stop受信直後のgrace。遅延した完了イベントを待つ内部状態
+        public const int Celebrating = 3;       // 完了通知。約5秒で消える一時表示
+        // 4 = StoppedIncomplete / 5 = Indeterminate は incomplete 表示と一緒に廃止した。
+        // 完了と言えない停止は何も表示しないので、この 2 状態は不要になった。
+        // 値は再利用しない (旧 debug ログとの取り違えを避けるため)。
+        public const int Finalizing = 6;        // root Stop 後の quiet window。表示は「作業中…」のまま
         public const int MetadataOnly = 7;      // SessionStart だけ受けた休眠状態。
                                                 // 表示しないし active にも数えない
 
@@ -250,7 +339,6 @@ namespace ClaudePet
         public int State;
         public long LastSeq;        // 単調増加のイベント順序
         public DateTime LastAtUtc;  // 古いエントリ掃除用
-        public DateTime LastActivityUtc; // 最後に実tool activityを観測した時刻 (「● 活動中」用)
 
         // 「依頼 (Request)」= そのセッションで最後に UserPromptSubmit が来てから
         // Stop までの1ターン。新しい依頼が始まったら進捗はリセットする。
@@ -271,7 +359,6 @@ namespace ClaudePet
         public bool IsCodex;
         public string TurnId = "";        // 現在 turn。これ以外の遅延イベントは UI へ反映しない
         public bool TurnHasSubagent;      // この turn で SubagentStart/Stop を観測した
-        public DateTime CodexGraceDueUtc; // Codex Stop quiet grace の満了時刻 (未設定=MinValue)
 
         public const int MaxTaskIds = 256;
 
@@ -281,9 +368,9 @@ namespace ClaudePet
         // ResetRequest() 以外では false へ戻さない (fail-closed)。
         public bool SawStructuredTasks;
 
-        // Claude の Finalizing quiet grace 満了時刻 (未設定=MinValue)。
-        // Codex の CodexGraceDueUtc とは値も意味も別物なので共通化しない。
-        public DateTime ClaudeGraceDueUtc;
+        // root Stop 後の quiet window 満了時刻 (未設定 = completion candidate 無し)。
+        // provider 共通。継続イベントで取消し、Stop 再受信で張り直す。
+        public DateTime QuietDueUtc;
 
         // 表示用 model identifier (sanitize 済み)。空 = 不明。
         // Claude は SessionStart、Codex は UserPromptSubmit の metadata 由来。
@@ -297,7 +384,7 @@ namespace ClaudePet
             SnapDone = 0;
             SnapInProg = 0;
             SawStructuredTasks = false;
-            ClaudeGraceDueUtc = DateTime.MinValue;
+            QuietDueUtc = DateTime.MinValue;
             if (CreatedIds != null) { CreatedIds.Clear(); CompletedIds.Clear(); InProgressIds.Clear(); }
         }
 
@@ -311,8 +398,9 @@ namespace ClaudePet
             }
         }
 
-        // 依頼全体の推定進捗。total<=0 なら進捗表示なし。
-        // in_progress は 0.5 個分の完了として加点する (作業着手を反映しつつ盛りすぎない)
+        // 「依頼全体の工程表」の現在地。今実行中の 1 タスクの進み具合ではない。
+        // in_progress の工程は 0.5 工程ぶん進んだものとして数える
+        // (着手を反映しつつ盛りすぎない、全体進捗の粗い推定)。
         public void GetProgress(out int done, out int inProg, out int total)
         {
             if (SnapTotal > 0) { done = SnapDone; inProg = SnapInProg; total = SnapTotal; return; }
@@ -328,11 +416,16 @@ namespace ClaudePet
             done = 0; inProg = 0; total = 0;
         }
 
+        // % を出すのに最低限必要な工程数。total=1 の plan は
+        // 「今やっている 1 個」でしかなく、依頼全体の進捗としての根拠が弱い。
+        public const int MinProgressTotal = 2;
+
         public int ProgressPercent()
         {
             int done, inProg, total;
             GetProgress(out done, out inProg, out total);
-            if (total <= 0) return -1;
+            // tracker 自体は保持したまま、% だけ出さない
+            if (total < MinProgressTotal) return -1;
             int pct = (int)Math.Floor((done + 0.5 * inProg) * 100.0 / total);
             return pct > 100 ? 100 : pct;
         }
@@ -344,29 +437,28 @@ namespace ClaudePet
 
         private static readonly IntPtr TimerBounce = new IntPtr(1);
         private static readonly IntPtr TimerRevert = new IntPtr(2);
-        private static readonly IntPtr TimerActivity = new IntPtr(3); // 「● 活動中」消灯用 one-shot
-        private static readonly IntPtr TimerFinalize = new IntPtr(4); // Claude: Stop後grace用 one-shot
-        private static readonly IntPtr TimerCodexGrace = new IntPtr(5); // Codex: Stop quiet grace用 one-shot
+        private static readonly IntPtr TimerQuiet = new IntPtr(4); // root Stop 後の quiet window 用 one-shot
 
         private const int BounceIntervalMs = 30;
         private const int RevertDelayMs = 3700;        // 完了バウンド後のメッセージ表示継続時間
-        private const int RevertDelayHiddenMs = 5000;  // 非表示セッションの完了エントリ掃除
-        private const int FinalizeGraceMs = 2000;      // Claude: Stop後、遅延完了イベントを待つ時間
-        // Codex: Stop は完了確定ではない。実測で最初の Stop が約1.88秒後に別 hook から
-        // continuation され、同一 turn の 2 回目 Stop が来るケースがあるため、
-        // Stop を completion candidate とし静穏 5 秒で確定する (Claude の 2 秒とは別物)。
-        private const int CodexQuietGraceMs = 5000;
-        private static readonly TimeSpan ActivityTtl = TimeSpan.FromSeconds(15); // 「● 活動中」の表示保持
+        // completion = root Stop + この静穏時間。provider 共通の唯一の完了条件。
+        // Stop は「終わった宣言」ではなく candidate で、継続イベントが来たら取消す。
+        // Claude 2 秒 / Codex 5 秒だった旧 grace は、意味が同じになったのでこれに統一した。
+        private const int CompletionQuietMs = 20000;
 
         private const int MaxSessions = 8;             // 通常同時利用は数セッション。無制限に増やさない
         private static readonly TimeSpan StaleAfter = TimeSpan.FromHours(4);
-        // 「途中で止まったよ」はユーザーが気付くまで残すが、終了済みセッションが
-        // 他のアクティブセッションの表示を塞ぎ続けないよう 10 分で自動的に消す
-        private static readonly TimeSpan IncompleteNoticeTtl = TimeSpan.FromMinutes(10);
 
         private const int AnimNone = 0;
         private const int AnimCelebrate = 1;  // 3回大きくバウンド
-        private const int AnimLight = 2;      // 2回控えめにピョコッ
+
+        // ---- 通知領域 (tray) ----
+        private const int WmTrayIcon = 0x8001;    // WM_APP + 1: tray callback
+        private const uint TrayIconId = 1;
+        private const int CmdShowPet = 1001;      // tray menu: ヒヨコを表示
+        private const int CmdHidePet = 1002;      // tray menu: ヒヨコを隠す
+        private const int CmdBringToFront = 1003; // tray menu: 最前面に戻す
+        private const int CmdExitPet = 1004;      // tray menu: ClaudePetを終了
 
         private IntPtr _hwnd;
         private Native.WndProcDelegate _wndProc; // GC防止のためフィールドで保持
@@ -380,9 +472,15 @@ namespace ClaudePet
         private int _animMode = AnimNone;
         private int _bounceFrame;
 
+        // 明示 hide (tray の「ヒヨコを隠す」)。visual だけの hide で、hooks 受信・
+        // 進捗・完了判定・session 管理は全て継続する。hidden 中は描画と完了音を止める。
+        private bool _petVisible = true;
+        private bool _trayAdded;
+        private IntPtr _trayIconHandle;
+
         private readonly Dictionary<string, Session> _sessions = new Dictionary<string, Session>();
         private long _seq;
-        private string _shownKey = ""; // 直前に描画した (session|state|project|progress)。同一なら再描画しない
+        private string _shownKey = ""; // 直前に描画した (session|state|project|pct|meta|others)。同一なら再描画しない
 
         // celebration/SessionEnd で削除した直後のセッション。async hook の遅延イベント
         // (数秒遅れの PostToolUse 等) が幽霊セッションとして再作成されるのを防ぐ。
@@ -411,10 +509,10 @@ namespace ClaudePet
             _scale = dpi / 96f;
 
             _winW = S(280); // ピル内テキストの幅で決まる (文字サイズを変えないので不変)
-            // 上余白10 + 最大 Working ピル126 + キャラとの間隔10 + キャラ〜ラベル74。
-            // ピルは provider/model の 1 行分 (17) だけ背が高くなった (204 -> 221)。
+            // 上余白10 + 最大ピル109 (ヘッダ+meta+bar+%+project) + 間隔10 + キャラ〜ラベル74。
+            // activity indicator 行の廃止で 1 行分縮んだ (221 -> 204)。
             // キャラは下端基準なので画面上の位置は変わらない。
-            _winH = S(221);
+            _winH = S(204);
 
             Native.RECT work = new Native.RECT();
             Native.SystemParametersInfo(0x0030 /*SPI_GETWORKAREA*/, 0, ref work, 0);
@@ -450,6 +548,7 @@ namespace ClaudePet
             RenderCurrent(true);
             Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
             PetDebug("startup: shown");
+            AddTrayIcon(); // 失敗しても Pet 本体は通常動作 (fail-soft)
 
             TrimMemory();
 
@@ -485,9 +584,16 @@ namespace ClaudePet
                 case Native.WM_TIMER:
                     if (wParam == TimerBounce) OnBounceTick();
                     else if (wParam == TimerRevert) OnRevert();
-                    else if (wParam == TimerActivity) OnActivityExpire();
-                    else if (wParam == TimerFinalize) OnFinalizeTick();
-                    else if (wParam == TimerCodexGrace) OnCodexGraceTick();
+                    else if (wParam == TimerQuiet) OnQuietTick();
+                    return IntPtr.Zero;
+
+                case WmTrayIcon:
+                    OnTrayCallback(lParam);
+                    return IntPtr.Zero;
+
+                case Native.WM_COMMAND:
+                    // tray context menu の選択 (TrackPopupMenuEx が owner へ post する)
+                    OnTrayCommand(unchecked((int)wParam.ToInt64()) & 0xFFFF);
                     return IntPtr.Zero;
 
                 case Native.WM_CLOSE:
@@ -495,8 +601,10 @@ namespace ClaudePet
                     return IntPtr.Zero;
 
                 case Native.WM_DESTROY:
+                    RemoveTrayIcon(); // menu 経由でも WM_CLOSE 経由でも tray を残さない
                     Native.KillTimer(_hwnd, TimerBounce);
                     Native.KillTimer(_hwnd, TimerRevert);
+                    Native.KillTimer(_hwnd, TimerQuiet);
                     Native.PostQuitMessage(0);
                     return IntPtr.Zero;
             }
@@ -565,7 +673,6 @@ namespace ClaudePet
             Session s;
             _sessions.TryGetValue(sessionId, out s);
 
-            bool becameWaiting = false;
             bool metadataTouched = false; // SessionStart は共通 Touch() を使わない
 
             switch (eventType)
@@ -583,35 +690,34 @@ namespace ClaudePet
                 case PetEvent.TaskSnapshot:
                 case PetEvent.TaskRemoved:
                 case PetEvent.TaskInProgress:
-                    // 終了系表示中の残イベントでは状態を戻さない
-                    // (「途中で止まったよ」等は次の UserPromptSubmit まで維持する)
-                    if (s != null && (s.State == Session.Celebrating ||
-                        s.State == Session.StoppedIncomplete || s.State == Session.Indeterminate))
-                    { Touch(s, project); break; }
-                    // 終了直後のセッションの遅延イベントは幽霊再作成になるので無視
-                    if (s == null && IsTombstoned(sessionId)) return;
+                    // 完了通知の表示中は蒸し返さない (次の UserPromptSubmit まで待つ)
+                    if (s != null && IsTerminal(s.State)) { Touch(s, project); break; }
+                    // 終了直後のセッションの遅延イベントは幽霊再作成になるので無視。
+                    // SessionStart で model だけ復帰した MetadataOnly も、tombstone が
+                    // 残っている間は旧 session 由来の遅延イベントとみなして Working にしない。
+                    if ((s == null || s.State == Session.MetadataOnly) && IsTombstoned(sessionId)) return;
                     // PostToolUse 系の cwd はツール実行ディレクトリで揺れることがあるため
                     // project 名は上書きしない (最初に確定した名前を維持)
                     s = Upsert(sessionId, s, project, false);
-                    if (s.State != Session.Finalizing) s.State = Session.Working;
-                    s.LastActivityUtc = DateTime.UtcNow; // 「● 活動中」
+                    // work continuation = まだ終わっていない。completion candidate は
+                    // 延長ではなく取消して Working へ戻す。次に完了できるのは
+                    // 新しい root Stop が来てからになる。
+                    s.State = Session.Working;
+                    s.QuietDueUtc = DateTime.MinValue;
                     // status を読めなかった tracker 観測。進捗値は触らず事実だけ残す
                     if (extra == PetEvent.StructuredObserved) s.SawStructuredTasks = true;
                     ApplyTaskEvent(s, eventType, extra);
-                    // grace 中に関連イベントが来たら静穏時間を数え直す。
-                    // ここでは絶対に celebration しない (100% になっても同じ)。
-                    // 完了を決められるのは quiet grace 満了後の FinalizeDue だけ。
-                    if (s.State == Session.Finalizing)
-                        s.ClaudeGraceDueUtc = DateTime.UtcNow.AddMilliseconds(FinalizeGraceMs);
                     break;
 
                 case PetEvent.SessionMetadata:
                     // SessionStart。model だけを覚える。UserPromptSubmit より先に来るので
                     // これだけでは「作業中…」を出さないし active にも数えない。
                     // 既存 session へ compact 等で再度来ても state / 進捗 / 完了候補は触らない。
-                    // startup/resume/clear/compact の正当な metadata なので、
-                    // SessionEnd 直後の resume でも tombstone を解除して受け取る。
-                    _recentlyEnded.Remove(sessionId);
+                    // tombstone 中でも model metadata 自体は受け取る (MetadataOnly で作る)。
+                    // ただし tombstone は消さない。SessionStart は「新しい作業が始まった」
+                    // という信号ではなく、ここで解除すると旧 session 由来の遅延
+                    // PostToolUse で Working へ昇格してしまう (async hook の race)。
+                    // 解除するのは UserPromptSubmit / PermissionPrompt だけ。
                     bool newMetadataSession = (s == null);
                     s = Upsert(sessionId, s, project, false);
                     if (s.State == 0) s.State = Session.MetadataOnly;
@@ -626,29 +732,35 @@ namespace ClaudePet
 
                 case PetEvent.PermissionPrompt:
                     _recentlyEnded.Remove(sessionId); // 正当な再開
-                    bool wasWaiting = (s != null && s.State == Session.Waiting);
                     s = Upsert(sessionId, s, project, true);
+                    // 完全 auto 運用: 確認 UI は出さない。state は互換のため Waiting のまま
+                    // 残すが、描画は「作業中…」と同じ。音もバウンドも無し。
+                    // permission 待ち = 作業継続なので completion candidate は取消す。
                     s.State = Session.Waiting;
-                    becameWaiting = !wasWaiting; // debounce: 既にWaitingなら音もアニメも出さない
+                    s.QuietDueUtc = DateTime.MinValue;
                     break;
 
                 case PetEvent.TaskComplete:
                     // 判定済みの表示中は蒸し返さない
                     if (s != null && IsTerminal(s.State)) { Touch(s, project); break; }
-                    if (s == null && IsTombstoned(sessionId)) return;
+                    // tombstone 中の MetadataOnly への Stop も旧 session 由来の遅延とみなす
+                    if ((s == null || s.State == Session.MetadataOnly) && IsTombstoned(sessionId)) return;
                     s = Upsert(sessionId, s, project, true);
-                    // structured task を観測済みかどうかに関わらず必ず quiet grace へ入る。
-                    // Claude の hook は async なので、Stop より前に発生した
-                    // TaskCreated/TodoWrite が Stop の後から届くことがある。
-                    // UI は Working 表示のまま。重複 Stop は deadline を延長する。
+                    // root Stop = completion candidate。tracker の状態は一切見ない。
+                    // UI は「作業中…」のまま quiet window を待つ。
+                    // 同じ session の 2 回目の Stop は最新 Stop から数え直す。
                     s.State = Session.Finalizing;
-                    s.ClaudeGraceDueUtc = DateTime.UtcNow.AddMilliseconds(FinalizeGraceMs);
+                    s.QuietDueUtc = DateTime.UtcNow.AddMilliseconds(CompletionQuietMs);
                     break;
 
                 case PetEvent.SessionEnd:
-                    // Celebrating 中は即削除しない (claude -p 終了時の SessionEnd が
-                    // 完了通知を打ち消してしまうため)。Finalizing 中も判定前なので残す
-                    // (削除すると完了/未完の通知が一切出なくなる)。
+                    // SessionEnd 単体は完了の根拠にしない。Celebrating 中は即削除しない
+                    // (claude -p 終了時の SessionEnd が完了通知を打ち消してしまうため)。
+                    // Finalizing 中も残して quiet window を継続させる
+                    // (削除すると Stop 済みの作業が完了通知されなくなる)。
+                    // tombstone 中の MetadataOnly への SessionEnd は旧 session の遅延分なので
+                    // 無視し、resume で覚えた model を消さない。
+                    if (s != null && s.State == Session.MetadataOnly && IsTombstoned(sessionId)) return;
                     if (s != null && s.State != Session.Celebrating && s.State != Session.Finalizing)
                     {
                         _sessions.Remove(sessionId);
@@ -661,49 +773,33 @@ namespace ClaudePet
             }
             if (s != null && !metadataTouched) Touch(s, project);
 
-            ArmClaudeFinalizeTimer();
-            // Claude は Stop 直後に Celebrating しない (FinalizeDue が決める)
-            AfterEvent(sessionId, false, becameWaiting);
+            ArmQuietTimer();
+            // Stop 直後に Celebrating しない。完了を決められるのは FinalizeDue だけ
+            AfterEvent();
         }
 
-        // イベント処理後の共通後処理 (prune / 音 / 再描画 / アニメ)。
-        // Claude・Codex どちらの handler からも同じ意味で呼ぶ。
-        private void AfterEvent(string sessionKey, bool becameCelebrating, bool becameWaiting)
+        // イベント処理後の共通後処理 (prune / 再描画)。
+        // 音とバウンドは完了時だけで、それを出せるのは FinalizeDue のみ。
+        // 確認要求・警告の音/アニメは完全 auto 運用のため廃止した。
+        private void AfterEvent()
         {
             Prune();
-
-            // 音は表示中かどうかに関わらず状態遷移時のみ1回
-            if (becameCelebrating) Native.MessageBeep(Native.SOUND_DEFAULT);
-            else if (becameWaiting) Native.MessageBeep(Native.SOUND_EXCLAMATION);
-
-            string displayId = ComputeDisplaySession();
             RenderCurrent(false);
-
-            bool displayed = (displayId == sessionKey);
-            if (becameCelebrating)
-            {
-                if (displayed) StartBounce(AnimCelebrate);
-                else Native.SetTimer(_hwnd, TimerRevert, RevertDelayHiddenMs, IntPtr.Zero);
-            }
-            else if (becameWaiting && displayed)
-            {
-                StartBounce(AnimLight);
-            }
         }
 
         // ---- Codex イベント処理 (provider + session + turn) ------------------
         //
-        // Claude 側 (OnEvent) とは意図的に分離している。Codex の Stop は完了確定では
-        // なく、interrupt では Stop 自体が来ない (Phase F 実測)。Claude の完了判定を
-        // Codex 仕様へ共通化しないことで、Claude の挙動を一切変えずに済ませている。
+        // Claude 側 (OnEvent) とは意図的に分離したまま。共通なのは quiet window の
+        // 長さ (CompletionQuietMs) と deadline 管理だけで、turn 分離・old-turn の
+        // 破棄・subagent fail-closed といった Codex 固有の判断はここにしか無い。
+        // interrupt では Stop 自体が来ない (Phase F 実測) ため、推測 timeout で
+        // 完了させることはしない。
         private void OnCodexEvent(int eventType, string sessionId, string project, string extra, string turnId)
         {
             _seq++;
             string key = CodexKey(sessionId);
             Session s;
             _sessions.TryGetValue(key, out s);
-
-            bool becameWaiting = false;
 
             switch (eventType)
             {
@@ -714,11 +810,9 @@ namespace ClaudePet
                     s = Upsert(key, s, project, true);
                     s.IsCodex = true;
                     s.State = Session.Working;
-                    s.ResetRequest();
+                    s.ResetRequest();   // 古い completion candidate もここで破棄される
                     s.TurnId = turnId;
                     s.TurnHasSubagent = false;
-                    s.CodexGraceDueUtc = DateTime.MinValue;
-                    s.LastActivityUtc = DateTime.MinValue;
                     // model は turn ごとに届く。空なら前 turn の値を残さず不明へ戻す。
                     s.ModelId = extra;
                     break;
@@ -734,9 +828,8 @@ namespace ClaudePet
                     s = Upsert(key, s, project, false);
                     s.IsCodex = true;
                     if (s.TurnId.Length == 0) s.TurnId = turnId; // 初観測 turn を採用
-                    s.LastActivityUtc = DateTime.UtcNow;
                     // work activity が来た = まだ終わっていない。completion candidate を破棄する
-                    s.CodexGraceDueUtc = DateTime.MinValue;
+                    s.QuietDueUtc = DateTime.MinValue;
                     s.State = Session.Working;
                     // status を読めなかった update_plan 観測。進捗値は触らず事実だけ残す
                     if (extra == PetEvent.StructuredObserved) s.SawStructuredTasks = true;
@@ -754,13 +847,13 @@ namespace ClaudePet
                     if (turnId.Length == 0) return;
                     _recentlyEnded.Remove(key);
                     if (s != null && !TurnMatches(s, turnId)) return;
-                    bool wasWaiting = (s != null && s.State == Session.Waiting);
                     s = Upsert(key, s, project, true);
                     s.IsCodex = true;
                     if (s.TurnId.Length == 0) s.TurnId = turnId;
+                    // 確認 UI は出さない (作業中…と同じ描画。音・バウンド無し)。
+                    // candidate 取消のため state だけ Waiting を維持する。
                     s.State = Session.Waiting;
-                    s.CodexGraceDueUtc = DateTime.MinValue;
-                    becameWaiting = !wasWaiting; // debounce
+                    s.QuietDueUtc = DateTime.MinValue;
                     break;
 
                 case PetEvent.CodexStop:
@@ -771,10 +864,10 @@ namespace ClaudePet
                     s = Upsert(key, s, project, true);
                     s.IsCodex = true;
                     if (s.TurnId.Length == 0) s.TurnId = turnId;
-                    // Stop = completion candidate。UI は Working のまま静穏 5 秒待つ。
-                    // 同一 turn の 2 回目 Stop なら 5 秒を最初から数え直す。
+                    // Stop = completion candidate。UI は「作業中…」のまま静穏を待つ。
+                    // 同一 turn の 2 回目 Stop なら quiet window を最初から数え直す。
                     s.State = Session.Finalizing;
-                    s.CodexGraceDueUtc = DateTime.UtcNow.AddMilliseconds(CodexQuietGraceMs);
+                    s.QuietDueUtc = DateTime.UtcNow.AddMilliseconds(CompletionQuietMs);
                     break;
 
                 case PetEvent.CodexSubagentStart:
@@ -788,7 +881,9 @@ namespace ClaudePet
                     if (IsTerminal(s.State)) { Touch(s, project); break; }
                     s.TurnHasSubagent = true;
                     s.SnapTotal = -1; s.SnapDone = 0; s.SnapInProg = 0; // 表示済み progress も無効化
-                    s.LastActivityUtc = DateTime.UtcNow;
+                    // subagent の出入りも work continuation。candidate を取消す
+                    if (s.State == Session.Finalizing) s.State = Session.Working;
+                    s.QuietDueUtc = DateTime.MinValue;
                     break;
 
                 case PetEvent.CodexSessionEnd:
@@ -807,8 +902,8 @@ namespace ClaudePet
             }
             if (s != null) Touch(s, project);
 
-            ArmCodexGraceTimer();
-            AfterEvent(key, false, becameWaiting); // Codex は Stop 直後に Celebrating しない
+            ArmQuietTimer();
+            AfterEvent(); // Codex も Stop 直後に Celebrating しない (FinalizeDue が決める)
         }
 
         // provider 名前空間の分離。Claude の session_id と衝突しない内部 key。
@@ -819,49 +914,29 @@ namespace ClaudePet
             return s.TurnId.Length == 0 || s.TurnId == turnId;
         }
 
+        // 表示上「終わった通知を出している」state。今は完了通知だけ。
         private static bool IsTerminal(int state)
         {
-            return state == Session.Celebrating ||
-                   state == Session.StoppedIncomplete ||
-                   state == Session.Indeterminate;
+            return state == Session.Celebrating;
         }
 
-        // Claude の quiet grace も session ごとに満了時刻を持ち、timer は最短期限へ
-        // 1 本だけ張る。Codex 用 (ArmCodexGraceTimer) とは timer ID も定数も別。
-        private void ArmClaudeFinalizeTimer()
+        // quiet window の満了時刻は session ごとに持ち、timer は最短期限へ 1 本だけ
+        // 張る (常時 timer / polling を増やさない)。provider は問わない。
+        private void ArmQuietTimer()
         {
             DateTime next = DateTime.MaxValue;
             foreach (var kv in _sessions)
             {
                 Session s = kv.Value;
-                if (s.IsCodex || s.State != Session.Finalizing) continue;
-                if (s.ClaudeGraceDueUtc == DateTime.MinValue) continue;
-                if (s.ClaudeGraceDueUtc < next) next = s.ClaudeGraceDueUtc;
+                if (s.State != Session.Finalizing) continue;
+                if (s.QuietDueUtc == DateTime.MinValue) continue;
+                if (s.QuietDueUtc < next) next = s.QuietDueUtc;
             }
-            Native.KillTimer(_hwnd, TimerFinalize);
+            Native.KillTimer(_hwnd, TimerQuiet);
             if (next == DateTime.MaxValue) return;
             double ms = (next - DateTime.UtcNow).TotalMilliseconds;
             if (ms < 30) ms = 30;
-            Native.SetTimer(_hwnd, TimerFinalize, (uint)ms, IntPtr.Zero);
-        }
-
-        // Codex の quiet grace は session ごとに満了時刻を持ち、timer は最短期限へ
-        // 1 本だけ張る (常時 timer / polling を増やさない)。
-        private void ArmCodexGraceTimer()
-        {
-            DateTime next = DateTime.MaxValue;
-            foreach (var kv in _sessions)
-            {
-                Session s = kv.Value;
-                if (!s.IsCodex || s.State != Session.Finalizing) continue;
-                if (s.CodexGraceDueUtc == DateTime.MinValue) continue;
-                if (s.CodexGraceDueUtc < next) next = s.CodexGraceDueUtc;
-            }
-            Native.KillTimer(_hwnd, TimerCodexGrace);
-            if (next == DateTime.MaxValue) return;
-            double ms = (next - DateTime.UtcNow).TotalMilliseconds;
-            if (ms < 30) ms = 30;
-            Native.SetTimer(_hwnd, TimerCodexGrace, (uint)ms, IntPtr.Zero);
+            Native.SetTimer(_hwnd, TimerQuiet, (uint)ms, IntPtr.Zero);
         }
 
         private void AddTombstone(string sessionId)
@@ -964,15 +1039,11 @@ namespace ClaudePet
             DateTime now = DateTime.UtcNow;
             foreach (var kv in _sessions)
             {
-                TimeSpan age = now - kv.Value.LastAtUtc;
-                bool stale = age > StaleAfter ||
-                    ((kv.Value.State == Session.StoppedIncomplete ||
-                      kv.Value.State == Session.Indeterminate) && age > IncompleteNoticeTtl);
-                if (stale)
-                {
-                    if (remove == null) remove = new List<string>();
-                    remove.Add(kv.Key);
-                }
+                // 終了系の session は FinalizeDue / OnRevert がその場で片付けるので、
+                // ここに残るのは「動いているはずなのに長時間音沙汰が無い」ものだけ。
+                if (now - kv.Value.LastAtUtc <= StaleAfter) continue;
+                if (remove == null) remove = new List<string>();
+                remove.Add(kv.Key);
             }
             if (remove != null)
             {
@@ -1008,7 +1079,9 @@ namespace ClaudePet
             }
         }
 
-        // 表示priority: Waiting > Celebrating > Working。同率は最新イベントのsession。
+        // 表示priority: active (Working/Finalizing/Waiting) > 完了通知 (Celebrating)。
+        // 同率は最新イベントの session。該当なし = null で呼び出し側は Idle を描く。
+        // 過去の完了通知が進行中の作業を隠さないことを優先する。
         private string ComputeDisplaySession()
         {
             string bestId = null;
@@ -1029,8 +1102,8 @@ namespace ClaudePet
         }
 
         // 「他に動いている session」の数え方。作業中と見なせる state だけ。
-        // 終了表示 (Celebrating / StoppedIncomplete / Indeterminate) と
-        // metadata-only は含めない。
+        // Finalizing (root Stop 後の quiet window) はユーザーから見て「作業中…」
+        // のままなので active に数える。完了通知と metadata-only は含めない。
         private static bool IsActive(int state)
         {
             return state == Session.Working || state == Session.Finalizing ||
@@ -1053,14 +1126,14 @@ namespace ClaudePet
         {
             switch (state)
             {
-                case Session.Waiting: return 3;
-                case Session.StoppedIncomplete: return 3; // Waiting と同格 (要ユーザー確認)。同格は最新優先
-                case Session.Indeterminate: return 3;
-                case Session.Celebrating: return 2;
-                case Session.Working: return 1;
-                case Session.Finalizing: return 1; // ユーザーには Working として見せる
-                case Session.MetadataOnly: return 0; // 表示しない
-                default: return 0;
+                // 今動いている作業が最優先 (Waiting / Finalizing も描画は「作業中…」)
+                case Session.Working: return 2;
+                case Session.Waiting: return 2;
+                case Session.Finalizing: return 2;
+                // 完了通知は約5秒で消える一時表示。active より下に置き、
+                // 過去の「終わったよ！」が進行中の作業を隠さないようにする。
+                case Session.Celebrating: return 1;
+                default: return 0; // MetadataOnly 等は表示候補にしない
             }
         }
 
@@ -1068,23 +1141,12 @@ namespace ClaudePet
 
         private void RenderCurrent(bool force)
         {
+            // 明示 hide 中は描画しない。state 更新だけが続き、Show 時に
+            // force 描画でその時点の最新 state に追いつく。
+            if (!_petVisible) return;
             string id = ComputeDisplaySession();
             Session s = (id != null) ? _sessions[id] : null;
             int pct = (s != null) ? s.ProgressPercent() : -1;
-
-            // 「● 活動中」: Working/Finalizing 中で最近実 tool activity を観測した場合のみ
-            bool active = false;
-            if (s != null && (s.State == Session.Working || s.State == Session.Finalizing))
-            {
-                TimeSpan since = DateTime.UtcNow - s.LastActivityUtc;
-                if (since < ActivityTtl)
-                {
-                    active = true;
-                    // 期限が来たら消灯用に one-shot timer (常時 timer ではない)
-                    int remainMs = (int)(ActivityTtl - since).TotalMilliseconds + 200;
-                    Native.SetTimer(_hwnd, TimerActivity, (uint)remainMs, IntPtr.Zero);
-                }
-            }
 
             // provider + model の 1 行と、他に動いている session 数。
             // どちらも完了判定には一切影響しない表示だけの情報。
@@ -1094,22 +1156,24 @@ namespace ClaudePet
             // 別 session の開始/終了で +N だけが変わる場合や、後から model が
             // 届いた場合も再描画させるため、key に含める。
             string key = (s == null) ? "idle"
-                : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + pct + "|" + (active ? 1 : 0)
+                : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + pct
                   + "|" + meta + "|" + others;
             if (!force && key == _shownKey) return; // 同一表示なら再描画しない (PostToolUse連発対策)
             _shownKey = key;
 
+            // visible state は 3 つだけ: Idle / 作業中… / 終わったよ！。
+            // Waiting も Finalizing (quiet window 中) も「作業中…」として描く。
             Bitmap bmp;
             if (s == null) bmp = PetRenderer.RenderIdle(_winW, _winH, _scale);
-            else if (s.State == Session.Waiting) bmp = PetRenderer.RenderWaiting(_winW, _winH, _scale, s.Project, meta, others);
-            else if (s.State == Session.StoppedIncomplete) bmp = PetRenderer.RenderStopped(_winW, _winH, _scale, s.Project, meta, others);
-            else if (s.State == Session.Indeterminate) bmp = PetRenderer.RenderIndeterminate(_winW, _winH, _scale, s.Project, meta, others);
-            else if (s.State == Session.Celebrating) bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project, meta, others);
-            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct, active, meta, others);
+            else if (s.State == Session.Celebrating)
+                bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project, meta, others);
+            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct, meta, others);
 
             using (bmp) { ApplyBitmap(bmp, _baseX, _baseY); }
 
             if (_animMode == AnimNone) MoveTo(_baseX, _baseY);
+            // 表示内容が実際に変わった時だけ TOPMOST を再保証する (event-driven のみ)
+            EnsureTopmost();
         }
 
         // ---- アニメーション ------------------------------------------------
@@ -1117,6 +1181,9 @@ namespace ClaudePet
         private void StartBounce(int mode)
         {
             Native.KillTimer(_hwnd, TimerBounce);
+            // 直前の完了通知の revert が残っていると、新しい通知が数百 ms で
+            // 消えてしまう。表示時間は通知ごとに数え直す。
+            Native.KillTimer(_hwnd, TimerRevert);
             _animMode = mode;
             _bounceFrame = 0;
             Native.SetTimer(_hwnd, TimerBounce, BounceIntervalMs, IntPtr.Zero);
@@ -1124,10 +1191,10 @@ namespace ClaudePet
 
         private void OnBounceTick()
         {
-            int totalFrames = (_animMode == AnimCelebrate) ? 44 : 22; // 約1.3秒 / 約0.65秒
-            int bounces = (_animMode == AnimCelebrate) ? 3 : 2;
-            // キャラを半分にしたので跳ね幅も半分 (体の大きさに対する比を保つ)
-            int amplitude = (_animMode == AnimCelebrate) ? S(11) : S(5);
+            // アニメは完了の 3 回バウンドだけ (警告系の軽バウンドは廃止)
+            const int totalFrames = 44; // 約1.3秒
+            const int bounces = 3;
+            int amplitude = S(11); // キャラ半分に合わせた跳ね幅
 
             _bounceFrame++;
             if (_bounceFrame >= totalFrames)
@@ -1148,117 +1215,86 @@ namespace ClaudePet
             MoveTo(_baseX, _baseY - offset);
         }
 
-        // Claude quiet grace 満了: 期限の来た Claude セッションだけ確定し、
-        // 残りがあれば最短期限へ timer を張り直す (one-shot のまま)。
-        private void OnFinalizeTick()
+        // quiet window 満了: 期限の来た session だけ確定し、残りがあれば
+        // 最短期限へ timer を張り直す (one-shot のまま)。
+        private void OnQuietTick()
         {
-            Native.KillTimer(_hwnd, TimerFinalize);
-            FinalizeDue(false);
-            ArmClaudeFinalizeTimer();
+            Native.KillTimer(_hwnd, TimerQuiet);
+            FinalizeDue();
+            ArmQuietTimer();
         }
 
-        // Codex quiet grace 満了: 期限の来た Codex セッションだけ確定し、
-        // 残りがあれば最短期限へ timer を張り直す (one-shot のまま)。
-        private void OnCodexGraceTick()
+        // quiet window の確定処理。completion の根拠は
+        // 「root Stop を受けた後 CompletionQuietMs のあいだ作業が再開されなかった」
+        // ことだけで、structured tracker の件数・完了状況は一切見ない。
+        // これは「成果物が正しい」という意味ではなく、Pet が本文を読まずに
+        // 判定できる範囲での「一連の作業の終了」でしかない。
+        //
+        // 他に active な session があるときは完了通知を出さず静かに片付ける。
+        // 完全 auto 運用では進行中の作業の表示を横取りしない方が有益で、
+        // 後から通知を再キューすることもしない (音も鳴らさない)。
+        private void FinalizeDue()
         {
-            Native.KillTimer(_hwnd, TimerCodexGrace);
-            FinalizeDue(true);
-            ArmCodexGraceTimer();
-        }
-
-        // Finalizing の確定処理。codex=false なら Claude の 2 秒 grace 満了、
-        // codex=true なら Codex の 5 秒 quiet grace 満了分のみを対象にする。
-        // 判定基準 (完了 / 未着手あり / in_progress のみ) は既存の完了哲学と同じ。
-        private void FinalizeDue(bool codex)
-        {
-            bool celebrated = false;
-            bool alerted = false;
-            string celebratedId = null;
             DateTime now = DateTime.UtcNow;
+            List<string> due = null;
             foreach (var kv in _sessions)
             {
                 Session s = kv.Value;
                 if (s.State != Session.Finalizing) continue;
-                if (s.IsCodex != codex) continue;
-                // 両 provider とも session ごとに満了時刻を持つ (再 Stop / 関連イベントで伸びる)。
-                // 期限未設定 = candidate 無し。推測 timeout で確定させない。
-                DateTime due = codex ? s.CodexGraceDueUtc : s.ClaudeGraceDueUtc;
-                if (due == DateTime.MinValue) continue;
-                if (due > now.AddMilliseconds(50)) continue;
-                int done, inProg, total;
-                s.GetProgress(out done, out inProg, out total);
-                if (total <= 0)
+                // 期限未設定 = candidate 無し。推測 timeout で確定させない
+                if (s.QuietDueUtc == DateTime.MinValue) continue;
+                if (s.QuietDueUtc > now.AddMilliseconds(50)) continue;
+                if (due == null) due = new List<string>();
+                due.Add(kv.Key);
+            }
+            if (due == null) return;
+
+            // 同時に満了したときは古い方から処理する。先に見る側からは残りが
+            // まだ active に見えるので、通知が残るのは最新の作業になる。
+            due.Sort(delegate(string a, string b)
+            {
+                return _sessions[a].LastSeq.CompareTo(_sessions[b].LastSeq);
+            });
+
+            bool celebrated = false;
+            foreach (string key in due)
+            {
+                Session s;
+                if (!_sessions.TryGetValue(key, out s)) continue;
+                s.QuietDueUtc = DateTime.MinValue;
+                if (OtherActiveCount(key) > 0)
                 {
-                    if (s.SawStructuredTasks)
-                    {
-                        // この依頼では task を観測したのに、今は件数が取れない
-                        // (snapshot 欠落 / リスト全消し / subagent で無効化)。
-                        // 「task なし依頼」へ格下げして完了扱いにはしない。
-                        s.State = Session.Indeterminate;
-                        alerted = true;
-                    }
-                    else
-                    {
-                        // structured task を一度も観測していない依頼だけ、
-                        // 従来どおり Stop を完了根拠にする (短い依頼の通知を失わない)。
-                        s.State = Session.Celebrating;
-                        celebrated = true;
-                        celebratedId = kv.Key;
-                    }
+                    // 進行中の作業があるので完了通知は出さない。エントリはその場で
+                    // 片付け、遅延イベントで幽霊復活しないよう tombstone を残す。
+                    _sessions.Remove(key);
+                    AddTombstone(key);
+                    PetDebug("finalize sess=" + key + " -> suppressed (other active)");
+                    continue;
                 }
-                else if (done >= total)
-                {
-                    // 全タスク completed を確認できた + Stop → ここだけが「終わったよ！」
-                    s.State = Session.Celebrating;
-                    celebrated = true;
-                    celebratedId = kv.Key;
-                }
-                else if (total - done - inProg > 0)
-                {
-                    // 一度も着手されていない Task が残っている = 明確に未完
-                    s.State = Session.StoppedIncomplete;
-                    alerted = true;
-                }
-                else
-                {
-                    // 残りは in_progress のみ。status の更新忘れの可能性があり、
-                    // 完了とも未完とも断定できない → 「終わったか確認してね」
-                    s.State = Session.Indeterminate;
-                    alerted = true;
-                }
-                s.CodexGraceDueUtc = DateTime.MinValue;
-                s.ClaudeGraceDueUtc = DateTime.MinValue;
+                s.State = Session.Celebrating;
                 _seq++;
                 s.LastSeq = _seq;
                 s.LastAtUtc = DateTime.UtcNow;
-                PetDebug("finalize" + (codex ? ":codex" : "") + " sess=" + kv.Key +
-                    " -> state=" + s.State + " (" + done + "+" + inProg + "ip/" + total + ")");
+                celebrated = true;
+                PetDebug("finalize sess=" + key + " -> state=" + s.State);
             }
 
-            if (celebrated) Native.MessageBeep(Native.SOUND_DEFAULT);
-            else if (alerted) Native.MessageBeep(Native.SOUND_EXCLAMATION);
-
-            string displayId = ComputeDisplaySession();
+            // 音とバウンドは実際に完了通知を出すときだけ。明示 hide 中は
+            // ユーザーが意図的に Pet を消しているので音も鳴らさない (後で再生もしない)。
+            if (celebrated && _petVisible) Native.MessageBeep(Native.SOUND_DEFAULT);
             RenderCurrent(false);
-
+            PetDebug("finalize-render shown=" + _shownKey);
             if (celebrated)
             {
-                if (displayId == celebratedId) StartBounce(AnimCelebrate);
-                else Native.SetTimer(_hwnd, TimerRevert, RevertDelayHiddenMs, IntPtr.Zero);
+                if (_petVisible) StartBounce(AnimCelebrate);
+                else
+                {
+                    // hidden 中でも Celebrating エントリは通常と同じ寿命で片付ける
+                    // (再表示した時に過去の完了通知を再生しないため)
+                    PetDebug("celebrate-muted (hidden)");
+                    Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
+                }
             }
-            else if (alerted && displayId != null && _sessions.ContainsKey(displayId) &&
-                (_sessions[displayId].State == Session.StoppedIncomplete ||
-                 _sessions[displayId].State == Session.Indeterminate))
-            {
-                StartBounce(AnimLight);
-            }
-        }
-
-        // 「● 活動中」の表示期限が切れたら消灯のため再描画する (one-shot)
-        private void OnActivityExpire()
-        {
-            Native.KillTimer(_hwnd, TimerActivity);
-            RenderCurrent(false);
         }
 
         private void OnRevert()
@@ -1282,14 +1318,171 @@ namespace ClaudePet
                 }
             }
 
-            RenderCurrent(false); // 残っている Waiting / Working セッションの表示へ戻る
+            RenderCurrent(false); // 残っている作業中セッションか Idle の表示へ戻る
             TrimMemory();
         }
 
+        // 位置だけを動かす (bounce の 30ms tick 用)。Z-order はここでは触らない
+        // (TOPMOST の再保証は EnsureTopmost に分離。毎 tick assert しない)。
         private void MoveTo(int x, int y)
         {
             Native.SetWindowPos(_hwnd, IntPtr.Zero, x, y, 0, 0,
                 Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_NOZORDER);
+        }
+
+        // ---- Z-order / 表示制御 --------------------------------------------
+
+        // TOPMOST の再保証。WS_EX_TOPMOST は作成時の一度きりでは不十分で、
+        // fullscreen 遷移・Win+D・secure desktop 等で OS が topmost band から
+        // 外すことがある (実運用で VS Code の背面へ回る現象を確認)。
+        // polling はせず、表示内容が実際に変わった時と明示操作の時だけ呼ぶ。
+        // SWP_NOACTIVATE で focus は奪わない。他の TOPMOST アプリと
+        // 争い続ける実装はしない (押しのけられたら tray の「最前面に戻す」で復帰)。
+        private void EnsureTopmost()
+        {
+            if (!_petVisible) return;
+            Native.SetWindowPos(_hwnd, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE |
+                Native.SWP_SHOWWINDOW);
+        }
+
+        private void ShowPet()
+        {
+            if (!_petVisible)
+            {
+                _petVisible = true;
+                // hidden 中は描画を止めていたので、まず今の最新 state を描いてから見せる
+                // (過去の通知の再生ではなく、現在の state をそのまま出す)
+                RenderCurrent(true);
+                Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
+            }
+            EnsureTopmost();
+            PetDebug("show-pet shown=" + _shownKey);
+        }
+
+        private void HidePet()
+        {
+            if (!_petVisible) return;
+            _petVisible = false;
+            if (_animMode != AnimNone)
+            {
+                // bounce 途中なら打ち切る。Celebrating の掃除 (OnRevert) は
+                // 本来 bounce 完了後に schedule されるので、ここで代わりに張る。
+                Native.KillTimer(_hwnd, TimerBounce);
+                _animMode = AnimNone;
+                Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
+            }
+            Native.ShowWindow(_hwnd, Native.SW_HIDE);
+            PetDebug("hide-pet");
+        }
+
+        // tray の「最前面に戻す」/ 左クリック。hidden なら再表示まで行う。
+        private void BringToFront()
+        {
+            if (!_petVisible) { ShowPet(); return; } // ShowPet が EnsureTopmost まで行う
+            EnsureTopmost();
+            PetDebug("topmost re-assert");
+        }
+
+        // ---- 通知領域 (system tray) -----------------------------------------
+
+        private void AddTrayIcon()
+        {
+            try
+            {
+                using (Bitmap bmp = PetRenderer.RenderTrayBitmap(32))
+                    _trayIconHandle = bmp.GetHicon();
+                var nid = new Native.NOTIFYICONDATA();
+                nid.cbSize = Marshal.SizeOf(typeof(Native.NOTIFYICONDATA));
+                nid.hWnd = _hwnd;
+                nid.uID = TrayIconId;
+                nid.uFlags = Native.NIF_MESSAGE | Native.NIF_ICON | Native.NIF_TIP;
+                nid.uCallbackMessage = WmTrayIcon;
+                nid.hIcon = _trayIconHandle;
+                nid.szTip = "ClaudePet"; // 静的 tooltip のみ。作業内容は載せない (privacy)
+                _trayAdded = Native.Shell_NotifyIcon(Native.NIM_ADD, ref nid);
+                PetDebug("tray: add " + (_trayAdded ? "ok" : "failed err=" + Marshal.GetLastWin32Error()));
+            }
+            catch (Exception ex)
+            {
+                // tray を作れなくても Pet 本体は通常動作させる (fail-soft)
+                _trayAdded = false;
+                PetDebug("tray: add exception " + ex.GetType().Name);
+            }
+        }
+
+        // 二重呼び出しでも安全 (WM_DESTROY と menu 終了経路の両方から呼ばれ得る)
+        private void RemoveTrayIcon()
+        {
+            if (_trayAdded)
+            {
+                var nid = new Native.NOTIFYICONDATA();
+                nid.cbSize = Marshal.SizeOf(typeof(Native.NOTIFYICONDATA));
+                nid.hWnd = _hwnd;
+                nid.uID = TrayIconId;
+                Native.Shell_NotifyIcon(Native.NIM_DELETE, ref nid);
+                _trayAdded = false;
+            }
+            if (_trayIconHandle != IntPtr.Zero)
+            {
+                Native.DestroyIcon(_trayIconHandle);
+                _trayIconHandle = IntPtr.Zero;
+            }
+        }
+
+        private void OnTrayCallback(IntPtr lParam)
+        {
+            int mouseMsg = unchecked((int)lParam.ToInt64()) & 0xFFFF;
+            if (mouseMsg == Native.WM_LBUTTONUP)
+            {
+                // 左クリック = 「見失った Pet を取り戻す」。hide には使わない
+                OnTrayCommand(CmdBringToFront);
+            }
+            else if (mouseMsg == Native.WM_RBUTTONUP || mouseMsg == Native.WM_CONTEXTMENU)
+            {
+                ShowTrayMenu();
+            }
+        }
+
+        private void ShowTrayMenu()
+        {
+            IntPtr menu = Native.CreatePopupMenu();
+            if (menu == IntPtr.Zero) return;
+            try
+            {
+                Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? Native.MF_GRAYED : 0),
+                    (uint)CmdShowPet, "ヒヨコを表示");
+                Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? 0 : Native.MF_GRAYED),
+                    (uint)CmdHidePet, "ヒヨコを隠す");
+                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdBringToFront, "最前面に戻す");
+                Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
+                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "ClaudePetを終了");
+
+                Native.POINT pt;
+                Native.GetCursorPos(out pt);
+                // 標準の tray menu パターン。SetForegroundWindow が無いと
+                // menu の外をクリックしても閉じない。Pet window は click-through +
+                // NOACTIVATE なので、これで keyboard 入力を奪い続けることはない。
+                Native.SetForegroundWindow(_hwnd);
+                Native.TrackPopupMenuEx(menu, Native.TPM_RIGHTBUTTON, pt.x, pt.y, _hwnd, IntPtr.Zero);
+                Native.PostMessage(_hwnd, Native.WM_NULL, IntPtr.Zero, IntPtr.Zero);
+            }
+            finally { Native.DestroyMenu(menu); }
+        }
+
+        private void OnTrayCommand(int id)
+        {
+            PetDebug("tray-cmd=" + id);
+            switch (id)
+            {
+                case CmdShowPet: ShowPet(); break;
+                case CmdHidePet: HidePet(); break;
+                case CmdBringToFront: BringToFront(); break;
+                case CmdExitPet:
+                    // WM_DESTROY が tray / timer の掃除まで行う
+                    Native.DestroyWindow(_hwnd);
+                    break;
+            }
         }
 
         private void ApplyBitmap(Bitmap bmp, int x, int y)
@@ -1351,58 +1544,26 @@ namespace ClaudePet
             return bmp;
         }
 
+        private static readonly Color TitleNeutral = Color.FromArgb(255, 100, 92, 84);   // 作業中
+
         // Working: 吹き出しなしの控えめなピル + 「作業中…」。
         // pct>=0 のときだけ依頼全体の推定進捗 (bar + 全体 推定N%) を追加表示する。
-        // Task 件数 (3/5 等) は表示しない。active=true で「● 活動中」を添える。
-        public static Bitmap RenderWorking(int w, int h, float scale, string project, int pct, bool active,
+        // Waiting も Finalizing (root Stop 後の quiet window) も同じ描画。
+        public static Bitmap RenderWorking(int w, int h, float scale, string project, int pct,
             string meta, int otherActive)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawWorkingPill(g, w, h, scale, project, pct, active, meta, otherActive);
+                DrawStatusPill(g, w, h, scale, "作業中…", TitleNeutral, project, pct, meta, otherActive);
             }
             return bmp;
         }
 
-        // 完了とも未完とも断定できない: 曖昧なまま確認を促す
-        public static Bitmap RenderIndeterminate(int w, int h, float scale, string project,
-            string meta, int otherActive)
-        {
-            Bitmap bmp = NewCanvas(w, h);
-            using (Graphics g = NewGraphics(bmp))
-            {
-                DrawChick(g, w, h, scale);
-                DrawPill(g, w, h, scale, "終わったか確認してね", project,
-                    Color.FromArgb(242, 255, 248, 228),   // 背景: 淡い黄 (Waiting より薄い)
-                    Color.FromArgb(255, 214, 178, 96),    // 枠: 薄いオレンジ
-                    Color.FromArgb(255, 150, 110, 40),    // 文字: 茶寄りオレンジ
-                    true, 14.5f, meta, otherActive);
-            }
-            return bmp;
-        }
-
-        // Stop したが Todo 未完: 完了とは言わない控えめな注意表示
-        public static Bitmap RenderStopped(int w, int h, float scale, string project,
-            string meta, int otherActive)
-        {
-            Bitmap bmp = NewCanvas(w, h);
-            using (Graphics g = NewGraphics(bmp))
-            {
-                DrawChick(g, w, h, scale);
-                DrawPill(g, w, h, scale, "途中で止まったよ", project,
-                    Color.FromArgb(242, 245, 236, 226),   // 背景: 淡いベージュ
-                    Color.FromArgb(255, 196, 156, 108),   // 枠: 茶系
-                    Color.FromArgb(255, 140, 96, 48),     // 文字: 濃い茶
-                    true, 16f, meta, otherActive);
-            }
-            return bmp;
-        }
-
-        // Working 用ピル: 作業中… / [progress bar + 全体 推定 N%] / [● 活動中] / [project]
-        private static void DrawWorkingPill(Graphics g, int w, int h, float scale, string project, int pct, bool active,
-            string meta, int otherActive)
+        // 状態ピル: <title> / [meta + +N] / [progress bar + 全体 推定 N%] / [project]。
+        private static void DrawStatusPill(Graphics g, int w, int h, float scale, string title, Color titleColor,
+            string project, int pct, string meta, int otherActive)
         {
             Color bg = Color.FromArgb(205, 250, 250, 248);
             Color border = Color.FromArgb(255, 210, 205, 196);
@@ -1410,7 +1571,6 @@ namespace ClaudePet
             Color subColor = Color.FromArgb(255, 130, 122, 112);
             Color trackColor = Color.FromArgb(255, 228, 224, 217);
             Color fillColor = Color.FromArgb(255, 232, 163, 66);
-            Color activeColor = Color.FromArgb(255, 74, 152, 88);
 
             bool hasProject = !string.IsNullOrEmpty(project);
             bool hasMeta = !string.IsNullOrEmpty(meta);
@@ -1419,8 +1579,6 @@ namespace ClaudePet
             float barY = 33f + metaH;
             float pctY = 45f + metaH;
             float cursor = ((pct >= 0) ? 66f : 32f) + metaH; // ヘッダ (+meta+bar+%) の下端
-            float actY = cursor;
-            if (active) cursor += 17f;
             float projY = cursor;
             if (hasProject) cursor += 19f;
 
@@ -1442,8 +1600,8 @@ namespace ClaudePet
                 fmt.Alignment = StringAlignment.Center;
 
                 using (var font = new Font("Yu Gothic UI", 15f * scale, FontStyle.Bold, GraphicsUnit.Pixel))
-                using (var brush = new SolidBrush(textColor))
-                    g.DrawString("作業中…", font, brush, w / 2f, by + 8 * scale, fmt);
+                using (var brush = new SolidBrush(titleColor))
+                    g.DrawString(title, font, brush, w / 2f, by + 8 * scale, fmt);
 
                 DrawMetaLine(g, bx, bw, scale, by + metaY * scale, meta, otherActive, subColor, textColor);
 
@@ -1472,14 +1630,6 @@ namespace ClaudePet
                         g.DrawString("全体 推定 " + pct + "%", font, brush, w / 2f, by + pctY * scale, fmt);
                 }
 
-                if (active)
-                {
-                    // 進捗率とは無関係の「最近実 tool activity を観測した」表示
-                    using (var font = new Font("Yu Gothic UI", 11.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                    using (var brush = new SolidBrush(activeColor))
-                        g.DrawString("● 活動中", font, brush, w / 2f, by + actY * scale, fmt);
-                }
-
                 if (hasProject)
                 {
                     using (var font = new Font("Yu Gothic UI", 12.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
@@ -1487,23 +1637,6 @@ namespace ClaudePet
                         g.DrawString(project, font, brush, w / 2f, by + projY * scale, fmt);
                 }
             }
-        }
-
-        // Waiting: 警告色の吹き出し + 「確認して！」 (完了と明確に区別)
-        public static Bitmap RenderWaiting(int w, int h, float scale, string project,
-            string meta, int otherActive)
-        {
-            Bitmap bmp = NewCanvas(w, h);
-            using (Graphics g = NewGraphics(bmp))
-            {
-                DrawChick(g, w, h, scale);
-                DrawPill(g, w, h, scale, "確認して！", project,
-                    Color.FromArgb(242, 255, 243, 214),   // 背景: 淡い黄
-                    Color.FromArgb(255, 226, 160, 66),    // 枠: オレンジ
-                    Color.FromArgb(255, 168, 96, 24),     // 文字: 濃いオレンジ
-                    true, 18f, meta, otherActive);
-            }
-            return bmp;
         }
 
         public static Bitmap RenderCelebrate(int w, int h, float scale, string project,
@@ -1625,6 +1758,44 @@ namespace ClaudePet
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             return g;
+        }
+
+        // 通知領域アイコン用の小さなひよこ。既存 DrawChick と同じ配色を
+        // そのまま使い、外部画像ファイルは増やさない。呼び出し側が
+        // Bitmap.GetHicon() で HICON 化し、DestroyIcon で解放する。
+        public static Bitmap RenderTrayBitmap(int size)
+        {
+            Bitmap bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (Graphics g = NewGraphics(bmp))
+            {
+                float cx = size / 2f;
+                float cy = size / 2f;
+                float r = size * 0.42f;
+
+                using (var body = new SolidBrush(BodyColor))
+                    g.FillEllipse(body, cx - r, cy - r, r * 2, r * 2);
+                using (var edge = new Pen(BodyEdge, Math.Max(1f, size * 0.05f)))
+                    g.DrawEllipse(edge, cx - r, cy - r, r * 2, r * 2);
+
+                using (var eye = new SolidBrush(Color.FromArgb(40, 34, 28)))
+                {
+                    float er = size * 0.075f;
+                    g.FillEllipse(eye, cx - r * 0.42f - er, cy - r * 0.28f - er, er * 2, er * 2);
+                    g.FillEllipse(eye, cx + r * 0.42f - er, cy - r * 0.28f - er, er * 2, er * 2);
+                }
+
+                using (var beak = new SolidBrush(BeakColor))
+                {
+                    PointF[] tri = new PointF[]
+                    {
+                        new PointF(cx - size * 0.09f, cy + r * 0.02f),
+                        new PointF(cx + size * 0.09f, cy + r * 0.02f),
+                        new PointF(cx, cy + r * 0.4f)
+                    };
+                    g.FillPolygon(beak, tri);
+                }
+            }
+            return bmp;
         }
 
         // キャラ本体だけの倍率。文字サイズ (ピル・ラベル) には掛けない。
