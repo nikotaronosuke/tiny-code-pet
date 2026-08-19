@@ -154,7 +154,7 @@ Write-Host "      Hooks take effect in new Codex sessions."
 
 # Self-check: prove the helper normalizes a sample payload without sending anything.
 # The helper is a GUI-subsystem exe, so stdio must be redirected via Start-Process.
-$sample = '{"hook_event_name":"UserPromptSubmit","session_id":"selfcheck","turn_id":"t0","cwd":"C:/dev/claude-desktop-pet"}'
+$sample = '{"hook_event_name":"UserPromptSubmit","session_id":"selfcheck","turn_id":"t0","cwd":"C:/path/to/tiny-code-pet"}'
 $inFile = [System.IO.Path]::GetTempFileName()
 $outFile = [System.IO.Path]::GetTempFileName()
 try {
