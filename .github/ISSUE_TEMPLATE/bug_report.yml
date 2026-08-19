@@ -1,0 +1,85 @@
+name: Bug report
+description: Something in AgentPet does not behave as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. AgentPet is a small personal tool, so please
+        include enough detail to reproduce the behaviour on another machine.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did the pet actually show or do?
+      placeholder: The pet stayed on "作業中…" after the task had clearly finished.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: It should have shown "終わったよ！" about 20 seconds after the last Stop.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - Claude Code
+        - Codex
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: AgentPet version / commit
+      description: Release tag (e.g. v1.0.0) or the commit SHA you built from.
+      placeholder: v1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: "`winver`, or Settings > System > About."
+      placeholder: Windows 11 24H2 (10.0.26100)
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Smallest sequence that shows the problem.
+      placeholder: |
+        1. Start ClaudePet.exe
+        2. Run a Claude Code task that uses a Todo list
+        3. Let it finish and wait 30 seconds
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: |
+        Create `bin\debug.flag` to enable `bin\debug.log`, reproduce, then paste
+        the relevant lines.
+
+        **Before pasting, check the log.** It contains session ids, project
+        directory names, and model identifiers. It never contains prompts,
+        responses, or source code, but please redact anything private to you —
+        absolute paths, internal project names, and so on.
+      render: text
+    validations:
+      required: false

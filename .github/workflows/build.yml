@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Windows build
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.ps1 drives the .NET Framework 4.8 csc.exe that ships with Windows,
+      # so there is no SDK to set up. csc warnings do not set a non-zero exit
+      # code, so treat any compiler diagnostic as a failure here.
+      - name: Build
+        shell: pwsh
+        run: |
+          $out = ./build.ps1 2>&1 | Out-String
+          Write-Host $out
+          if ($out -match 'warning [A-Z]{2}\d+|error [A-Z]{2}\d+') {
+            Write-Error "compiler diagnostics present"
+            exit 1
+          }
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          $expected = @(
+            'bin/ClaudePet.exe',
+            'bin/ClaudePetNotify.exe',
+            'bin/CodexPetNotify.exe'
+          )
+          $missing = $expected | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            Write-Error ("missing build output: " + ($missing -join ', '))
+            exit 1
+          }
+          Get-Item $expected | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentPet-windows-build
+          path: |
+            bin/ClaudePet.exe
+            bin/ClaudePetNotify.exe
+            bin/CodexPetNotify.exe
+          if-no-files-found: error

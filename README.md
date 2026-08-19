@@ -1,16 +1,37 @@
-# Claude Desktop Pet 🐣
+# AgentPet 🐣
 
-A tiny native Windows desktop pet that shows what Claude Code (and Codex) is doing — working, waiting for you, overall progress, and truthful completion — at a glance.
+[![Build](https://github.com/nikotaronosuke/agent-desktop-pet/actions/workflows/build.yml/badge.svg)](https://github.com/nikotaronosuke/agent-desktop-pet/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
 
-Claude Code / Codex の状態を、デスクトップ右下の小さなひよこを見るだけで
-把握できる **超軽量デスクトップ通知キャラクター** です。
+> A tiny native Windows desktop pet for Claude Code and Codex.
+
+Claude Code / Codex の作業状況・依頼全体の推定進捗・作業終了を、
+画面右下の小さなひよこで確認できる **超軽量 Windows デスクトップ Pet** です。
 Claude Code と Codex を同時に使っても session / 状態は衝突しません。
+
+![AgentPet preview](docs/assets/agentpet-preview.png)
+
+**一目でわかる特徴**
+
+| | |
+|---|---|
+| 🤖 **Claude Code + Codex 対応** | 1 匹の Pet が両方を監視。どちらか片方だけでも使える |
+| 🪟 **Windows native** | 純 Win32 (C# P/Invoke)。Electron / WebView / Node 常駐なし |
+| 🚫 **邪魔をしない** | クリック透過・タスクバー/Alt+Tab 非表示・focus を奪わない |
+| 🐥 **tray から操作** | 表示 / 隠す / 最前面に戻す / 終了 |
+| 📊 **依頼全体の推定進捗** | 「今のタスク」ではなく依頼全体の工程表から算出 |
+| ✅ **root Stop + 20 秒静穏で完了** | tracker の状態に依存しない誠実な完了判定 |
+| 🔒 **privacy** | prompt / 応答 / ソース本文を一切読まない |
+| 🪶 **idle CPU ほぼ 0** | イベント駆動のみ。polling なし |
+
+## 表示
 
 完全 auto 運用向けに、見える状態は 3 つだけ:
 
 | 状態 | 表示 | 意味 |
 |---|---|---|
-| Idle | 🐣 + `Claude` | 何もしていない。完全静止 |
+| Idle | 🐣 + `AgentPet` | 何もしていない。完全静止 |
 | 作業中 | 🐣 + 「作業中…」(+ 「**全体 推定 N%**」) + project名 | 放置してよい。permission 待ちも、Stop 後の静穏待ちも、すべてこの表示 |
 | 完了 | 🐣 + 「終わったよ！」+ project名 | root Stop の後 20 秒間その作業が再開されなかった (3回ピョコピョコ・通知音1回・約5秒後に Idle) |
 
@@ -197,7 +218,7 @@ VS Code で入力中に Pet の表示が切り替わっても入力先は変わ�
 | 操作 | 動作 |
 |---|---|
 | 左クリック | 最前面へ復帰 (hidden なら再表示 + 最新 state 描画 + 最前面) |
-| 右クリック | menu: ヒヨコを表示 / ヒヨコを隠す / 最前面に戻す / ClaudePetを終了 |
+| 右クリック | menu: ヒヨコを表示 / ヒヨコを隠す / 最前面に戻す / AgentPetを終了 |
 
 「ヒヨコを隠す」は **visual hide** であって監視停止ではない。hidden 中も
 hooks 受信・進捗更新・完了判定・session 管理はすべて継続し、再表示した
@@ -337,27 +358,47 @@ async はあくまで性能最適化であり、sync になっても正しさは
 - (任意) Codex — Hooks 対応バージョン。VS Code 拡張 26.814.41407 /
   Codex CLI 0.148.0-alpha.15 で仕様を実測して実装
 
-## Build
+## Installation
+
+Claude Code だけ / Codex だけ / 両方、どの構成でも使えます。
+使いたい方の hook だけを入れてください。
+
+### Option 1: Download release (おすすめ)
+
+1. [Releases](https://github.com/nikotaronosuke/agent-desktop-pet/releases) から
+   `AgentPet-v1.0.0-windows.zip` をダウンロードして展開
+2. hook を登録する
 
 ```powershell
-git clone https://github.com/nikotaronosuke/claude-desktop-pet.git
-cd claude-desktop-pet
+pwsh -File install-hook.ps1         # Claude Code 用
+pwsh -File install-codex-hook.ps1   # Codex 用 (先に -DryRun で差分確認を推奨)
+.\bin\ClaudePet.exe                 # 常駐開始 (Hook 発火時に自動起動もされる)
+```
+
+配布 binary は署名していないため、初回実行時に Windows SmartScreen が
+警告を出すことがあります。気になる場合は Option 2 でソースからビルドしてください。
+
+### Option 2: Build from source
+
+```powershell
+git clone https://github.com/nikotaronosuke/agent-desktop-pet.git
+cd agent-desktop-pet
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
 `bin\ClaudePet.exe` (常駐本体)、`bin\ClaudePetNotify.exe` (Claude Hook ヘルパー)、
-`bin\CodexPetNotify.exe` (Codex Hook ヘルパー) が生成される。
+`bin\CodexPetNotify.exe` (Codex Hook ヘルパー) が生成されます。
 コンパイルには Windows 標準の `csc.exe` (.NET Framework 4.8 同梱) を使うため、
-Visual Studio や .NET SDK は不要。
+Visual Studio や .NET SDK は不要です。
 
-## Installation
+その後 Option 1 と同じ install script を実行してください。
+Codex 側の詳細は「Codex 対応 › Setup」を参照 (`install-codex-hook.ps1`)。
 
-```powershell
-pwsh -File install-hook.ps1   # または powershell -File install-hook.ps1
-.\bin\ClaudePet.exe           # 常駐開始 (Hook発火時に自動起動もされる)
-```
-
-Codex 側の導入は「Codex 対応 › Setup」を参照 (`install-codex-hook.ps1`)。
+> **Note**
+> 公開上の製品名は **AgentPet** ですが、binary 名は既存の hook 設定・
+> install script との互換性のため `ClaudePet.exe` / `ClaudePetNotify.exe` /
+> `CodexPetNotify.exe` のままです (rename 漏れではありません)。
+> WndClass 名・mutex 名・WM_COPYDATA プロトコルも同じ理由で変更していません。
 Claude 側と Codex 側は独立していて、片方だけ入れても動く。
 
 `install-hook.ps1` はユーザーレベル設定 `%USERPROFILE%\.claude\settings.json` に
