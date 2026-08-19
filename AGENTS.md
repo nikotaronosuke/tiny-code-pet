@@ -2,7 +2,7 @@
 
 このファイルが project 固有ルールの正本。全 project 共通ルール
 (Git 安全運用・secret 非表示・スコープ規律等) は global の
-`C:\dev\agent-guidelines\AGENTS.md` にあり、ここには再掲しない。
+`C:\path\to\agent-guidelines\AGENTS.md` にあり、ここには再掲しない。
 
 ## Project status
 
