@@ -1,4 +1,6 @@
-// ClaudePet.exe - 常駐デスクトップペット本体
+// AgentPet - 常駐デスクトップペット本体 (binary 名は ClaudePet.exe)
+// 公開上の製品名は AgentPet。exe 名 / class 名 / namespace / WndClassName /
+// mutex 名は既存 hooks と install script との互換のため ClaudePet* のまま。
 // 純Win32 (P/Invoke) + layered window。アイドル時は GetMessage でブロックし CPU 0%。
 // 描画は System.Drawing で ARGB ビットマップを合成し UpdateLayeredWindow で反映。
 // タイマーはアニメーション中のみ SetTimer し、終了後は必ず KillTimer する。
@@ -33,8 +35,9 @@
 // 満了時に他の active が無いときだけで、過去の完了で進行中の作業を隠さない。
 //
 // Z-order: 通常ウィンドウより常に前面 (TOPMOST)。ただし WS_EX_TOPMOST は
-// 作成時の一度きりでは不十分で、fullscreen 遷移等で OS が topmost band から
-// 外すことがある (実運用で確認)。表示内容が変わった時と明示操作の時だけ
+// 作成時の一度きりでは不十分だった。実運用で背面へ回る現象を確認しており、
+// 何らかの理由で TOPMOST を失った場合に再保証する経路が無かった (失った
+// 具体的な契機は特定できていない)。表示内容が変わった時と明示操作の時だけ
 // HWND_TOPMOST + SWP_NOACTIVATE で再保証する (polling も常時 timer も無し)。
 // focus は決して奪わない (WS_EX_NOACTIVATE / click-through 維持)。
 //
@@ -532,7 +535,7 @@ namespace ClaudePet
             _hwnd = Native.CreateWindowEx(
                 Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT | Native.WS_EX_TOOLWINDOW |
                 Native.WS_EX_NOACTIVATE | Native.WS_EX_TOPMOST,
-                WndClassName, "Claude Pet", Native.WS_POPUP,
+                WndClassName, "AgentPet", Native.WS_POPUP,
                 _baseX, _baseY, _winW, _winH,
                 IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
 
@@ -1332,9 +1335,11 @@ namespace ClaudePet
 
         // ---- Z-order / 表示制御 --------------------------------------------
 
-        // TOPMOST の再保証。WS_EX_TOPMOST は作成時の一度きりでは不十分で、
-        // fullscreen 遷移・Win+D・secure desktop 等で OS が topmost band から
-        // 外すことがある (実運用で VS Code の背面へ回る現象を確認)。
+        // TOPMOST の再保証。WS_EX_TOPMOST は作成時の一度きりでは不十分だった。
+        // 実運用で VS Code の背面へ回る現象を確認しており、何らかの理由で
+        // TOPMOST を失った場合に再保証する経路が無かった (失った具体的な契機は
+        // 特定できていない)。そのため原因の除去ではなく「失っても次の機会に
+        // 戻す」方向にしている。
         // polling はせず、表示内容が実際に変わった時と明示操作の時だけ呼ぶ。
         // SWP_NOACTIVATE で focus は奪わない。他の TOPMOST アプリと
         // 争い続ける実装はしない (押しのけられたら tray の「最前面に戻す」で復帰)。
@@ -1399,7 +1404,7 @@ namespace ClaudePet
                 nid.uFlags = Native.NIF_MESSAGE | Native.NIF_ICON | Native.NIF_TIP;
                 nid.uCallbackMessage = WmTrayIcon;
                 nid.hIcon = _trayIconHandle;
-                nid.szTip = "ClaudePet"; // 静的 tooltip のみ。作業内容は載せない (privacy)
+                nid.szTip = "AgentPet"; // 静的 tooltip のみ。作業内容は載せない (privacy)
                 _trayAdded = Native.Shell_NotifyIcon(Native.NIM_ADD, ref nid);
                 PetDebug("tray: add " + (_trayAdded ? "ok" : "failed err=" + Marshal.GetLastWin32Error()));
             }
@@ -1456,7 +1461,7 @@ namespace ClaudePet
                     (uint)CmdHidePet, "ヒヨコを隠す");
                 Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdBringToFront, "最前面に戻す");
                 Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
-                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "ClaudePetを終了");
+                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "AgentPetを終了");
 
                 Native.POINT pt;
                 Native.GetCursorPos(out pt);
@@ -1539,7 +1544,7 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawLabel(g, w, h, scale, "Claude");
+                DrawLabel(g, w, h, scale, "AgentPet");
             }
             return bmp;
         }
