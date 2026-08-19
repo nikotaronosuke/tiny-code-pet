@@ -566,6 +566,7 @@ namespace ClaudePet
             _sessions.TryGetValue(sessionId, out s);
 
             bool becameWaiting = false;
+            bool metadataTouched = false; // SessionStart は共通 Touch() を使わない
 
             switch (eventType)
             {
@@ -608,10 +609,19 @@ namespace ClaudePet
                     // SessionStart。model だけを覚える。UserPromptSubmit より先に来るので
                     // これだけでは「作業中…」を出さないし active にも数えない。
                     // 既存 session へ compact 等で再度来ても state / 進捗 / 完了候補は触らない。
-                    if (s == null && IsTombstoned(sessionId)) return;
+                    // startup/resume/clear/compact の正当な metadata なので、
+                    // SessionEnd 直後の resume でも tombstone を解除して受け取る。
+                    _recentlyEnded.Remove(sessionId);
+                    bool newMetadataSession = (s == null);
                     s = Upsert(sessionId, s, project, false);
                     if (s.State == 0) s.State = Session.MetadataOnly;
                     s.ModelId = extra;
+                    // model 更新だけで表示優先度 (LastSeq) を奪わない。
+                    // 新規 MetadataOnly だけ eviction 順序用に LastSeq を持たせ、
+                    // LastAtUtc は stale 管理のため常に更新する。
+                    if (newMetadataSession) s.LastSeq = _seq;
+                    s.LastAtUtc = DateTime.UtcNow;
+                    metadataTouched = true;
                     break;
 
                 case PetEvent.PermissionPrompt:
@@ -649,7 +659,7 @@ namespace ClaudePet
                 default:
                     return;
             }
-            if (s != null) Touch(s, project);
+            if (s != null && !metadataTouched) Touch(s, project);
 
             ArmClaudeFinalizeTimer();
             // Claude は Stop 直後に Celebrating しない (FinalizeDue が決める)

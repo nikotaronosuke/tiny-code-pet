@@ -311,10 +311,14 @@ namespace ClaudePetNotify
                     }
                 }
 
-                // 頻度の高い低優先イベントではペットを起こさない (未起動なら捨てる)
+                // 頻度の高い低優先イベントではペットを起こさない (未起動なら捨てる)。
+                // SessionStart は最初の UserPromptSubmit より先に来るので、ここで
+                // 起こさないと model metadata を取りこぼす (低頻度なので安全)。
+                // 起動しても SessionStart だけでは Idle 表示のまま。
                 bool mayAutoStart = (eventType == EvTaskComplete ||
                                      eventType == EvPromptSubmit ||
-                                     eventType == EvPermissionPrompt);
+                                     eventType == EvPermissionPrompt ||
+                                     eventType == EvSessionMetadata);
 
                 IntPtr hwnd = FindWindow(WndClassName, null);
                 if (hwnd == IntPtr.Zero)
