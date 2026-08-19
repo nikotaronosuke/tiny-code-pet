@@ -160,8 +160,8 @@ marker でも、正常な snapshot でも true になり、**`ResetRequest()`
 - snapshot の件数は問わない。`total=0` (リスト全消し) でも
   「tracker なし依頼」へは格下げしない (安易に complete としない)。
 - marker 受信時に snapshot 値は一切触らない。既存の有効な snapshot を
-  消さないし、進捗率も捧造しない。tracker の存在だけを sticky にする。
-- Codex では subagent 拑制中の update_plan でも観測事実は残す
+  消さないし、進捗率も捏造しない。tracker の存在だけを sticky にする。
+- Codex では subagent 抑制中の update_plan でも観測事実は残す
   (progress へは適用しないまま)。
 
 ## Claude の quiet grace (root Stop は常に 2 秒)

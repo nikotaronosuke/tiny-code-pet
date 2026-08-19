@@ -129,6 +129,7 @@ Stop 受信
   └─ 常に Finalizing (約2秒の quiet grace。UI は作業中のまま)
         ├─ grace 中の関連イベントで grace を数え直す (100% になってもその場では通知しない)
         └─ grace 満了
+              ├─ 全件 completed (または Task の無い依頼) → 終わったよ！
               ├─ 未着手 (pending) Task が残る → 途中で止まったよ (明確に未完)
               └─ 残りが in_progress のみ → 終わったか確認してね (断定しない)
 ```
@@ -220,7 +221,7 @@ async はあくまで性能最適化であり、sync になっても正しさは
 - **`update_plan` を使っているときだけ** 進捗を表示する。
   `tool_input.plan` は全量 snapshot なので status の件数だけを数える
   (plan の step 本文は読まない)。
-- plan がない依頼では **% を捧造しない** (進捗非表示)。
+- plan がない依頼では **% を捏造しない** (進捗非表示)。
   snapshot を取れなかった hook も同じで、推測で埋めず次の snapshot で自己修復する。
 - 計算式は Claude と同じ `(completed + 0.5 × in_progress) ÷ total`。
 
