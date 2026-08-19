@@ -465,15 +465,15 @@ provider / model / session count は **表示だけの情報**で、
 ### WS_EX_TOPMOST だけでは背面へ回る
 
 実運用で「最初は VS Code より前面 → いつの間にか背面」という現象を確認した。
-原因は、TOPMOST の指定が **CreateWindowEx の一度きり**だったこと。
+問題は、TOPMOST の指定が **CreateWindowEx の一度きり**で、
+**何らかの理由で TOPMOST を失った場合に再保証する経路が無かった**こと。
 
 - `MoveTo` (bounce の 30ms tick) は `SWP_NOZORDER` で Z-order を触らない
 - `UpdateLayeredWindow` も Z-order を変えない
-- つまり一度 topmost band から外れると、二度と戻る経路が無かった
+- つまり一度 topmost を失うと、二度と戻る経路が無かった
 
-OS が topmost を剥がすのは fullscreen アプリの遷移・Win+D・secure desktop
-などで正常に起こり得る。修正は「剥がされない」ことではなく
-「剥がされても次の機会に戻る」こと。
+失った具体的な契機は特定できていない (実測できたのは結果としての背面化だけ)。
+そのため修正は原因の除去ではなく「失っても次の機会に戻す」方向にした。
 
 ### EnsureTopmost (event-driven のみ)
 
@@ -543,8 +543,8 @@ hide しても process・HWND・mutex・session 管理・hooks 受信・完了�
 かつては PostToolUse 観測時に「● 活動中」(TTL 15 秒) を表示していたが、
 完全 auto 運用への簡素化で廃止した。表示専用だった
 `LastActivityUtc` / `ActivityTtl` / `TimerActivity` / `OnActivityExpire` も削除。
-PostToolUse 自体は Waiting 解除・structured tracker・quiet grace 再起動・
-Codex completion candidate 取消に今も必須で、event 処理は残している。
+PostToolUse 自体は Waiting 解除・structured tracker・completion candidate
+取消 (Claude / Codex とも) に今も必須で、event 処理は残している。
 
 ## Multi-session
 

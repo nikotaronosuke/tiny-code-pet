@@ -182,9 +182,10 @@ Pet は**通常のアプリウィンドウより常に前面** (TOPMOST) に表�
 ただし focus は決して奪わない: クリック透過 + `WS_EX_NOACTIVATE` なので、
 VS Code で入力中に Pet の表示が切り替わっても入力先は変わらない。
 
-`WS_EX_TOPMOST` は作成時の一度きりでは不十分で、fullscreen アプリや
-Win+D、secure desktop 遷移などで OS が topmost band から外すことがある
-(実運用で VS Code の背面へ回る現象を確認)。Pet は**表示内容が実際に
+`WS_EX_TOPMOST` は作成時の一度きりでは不十分だった。実運用で
+「最初は VS Code より前面 → その後 VS Code の背面へ回る」現象を確認しており、
+**何らかの理由で TOPMOST を失った場合に、それを再保証する経路が無かった**。
+(失った具体的な契機までは特定できていない。) Pet は**表示内容が実際に
 変わったとき**に `HWND_TOPMOST + SWP_NOACTIVATE` で Z-order を再保証する
 (event-driven のみ。polling も常時タイマーも増やしていない)。
 
@@ -270,7 +271,7 @@ pwsh -File install-codex-hook.ps1           # 実際に追記
 | `UserPromptSubmit` | なし | sync | 新 turn 登録 / 依頼リセット |
 | `PostToolUse` | `.*` | async | activity 表示・`update_plan` 進捗 |
 | `PermissionRequest` | `.*` | sync | 完了候補取消 (確認 UI は出さない) |
-| `Stop` | なし | sync | 完了候補 (5 秒 grace 開始) |
+| `Stop` | なし | sync | 完了候補 (20 秒 quiet window 開始) |
 | `SessionEnd` | なし | sync | 後片付け |
 | `SubagentStart` / `SubagentStop` | なし | sync | subagent 検知 (完了にはしない) |
 
@@ -368,7 +369,7 @@ Claude 側と Codex 側は独立していて、片方だけ入れても動く。
 | `Stop` | なし | 完了通知 |
 | `UserPromptSubmit` | なし | Working 開始 / 依頼リセット |
 | `Notification` | `permission_prompt` | 受信のみ (確認 UI は出さない) |
-| `PostToolUse` | `*` | Waiting 解除・Task/Todo 進捗・grace 再起動 |
+| `PostToolUse` | `*` | Waiting 解除・Task/Todo 進捗・completion candidate 取消 |
 | `SessionStart` | なし | model 表示用 metadata (これだけでは作業中にしない) |
 | `SessionEnd` | なし | セッション後片付け |
 | `TaskCreated` | なし | Task 進捗 |
