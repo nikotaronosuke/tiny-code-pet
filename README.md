@@ -16,6 +16,11 @@ Claude Code と Codex を同時に使っても session / 状態は衝突しま�
 | Indeterminate | 🐣 + 「終わったか確認してね」+ project名 | Stop したが残 Task が in_progress のみ = **完了とも未完とも断定できない** (薄オレンジ吹き出し・警告音1回・最大10分表示) |
 | Completed | 🐣 + 「終わったよ！」+ project名 | **依頼全体が本当に完了** (白吹き出し・3回ピョコピョコ・通知音1回・約5秒後に次の表示へ) |
 
+表示中の session には **provider + model** の 1 行が付く (`Claude · Opus 4.6` /
+`Codex · GPT-5.6-codex`)。model を取れないときは provider だけ。
+同行の右端の **`+N`** は「他に動いている session 数」で、
+Working / Finalizing / Waiting の session だけを数える (0 なら非表示)。
+
 Working 中に最近の実 tool activity を観測すると「**● 活動中**」(緑) が添えられる。
 これは進捗率ではなく「Claude が実際に動いている」ことだけを示す
 (進捗%が動かない時間でも stuck ではないと分かる)。最後の activity から15秒で自動消灯。
@@ -306,6 +311,7 @@ Claude 側と Codex 側は独立していて、片方だけ入れても動く。
 | `UserPromptSubmit` | なし | Working 開始 / 依頼リセット |
 | `Notification` | `permission_prompt` | 確認して！ (idle_prompt 等は発火させない) |
 | `PostToolUse` | `*` | 活動表示・Waiting 解除・Task/Todo 進捗 |
+| `SessionStart` | なし | model 表示用 metadata (これだけでは作業中にしない) |
 | `SessionEnd` | なし | セッション後片付け |
 | `TaskCreated` | なし | Task 進捗 |
 | `TaskCompleted` | なし | Task 進捗 |
@@ -359,6 +365,9 @@ Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$e
 - マルチモニタ: プライマリモニタの右下固定。モニタ構成変更後はペット再起動が必要
 - DPI はシステム DPI 基準 (セッション中の DPI 変更には追従しない)
 - キャラはコード描画のひよこ (`src/Pet.cs` の `PetRenderer` 差し替えで変更可能)
+- **Claude の model 表示は `SessionStart` 経由**なので、`/model` でセッション途中に
+  切り替えると、次の startup / resume / clear / compact まで古いままになる。
+  transcript 監視や polling を入れてまで追跡しない (model 不明時は provider だけ表示)
 - Codex: `SubagentStart` / `SubagentStop` の実発火未確認。subagent を含む turn では
   進捗を表示しない (上記 Known limitation)
 - Codex: interrupt では `Stop` が来ないため「作業中…」が残る

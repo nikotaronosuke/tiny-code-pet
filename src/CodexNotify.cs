@@ -10,6 +10,7 @@
 //
 // Codex 正規化イベント (dwData 20〜27。1〜10 は Claude 専用で意味を変えない):
 //   20 = codex_prompt_submit    (UserPromptSubmit)  新 turn 登録 + 進捗リセット
+//                                extra = sanitized model identifier (空のこともある)
 //   21 = codex_activity         (PostToolUse)       tool activity
 //   22 = codex_plan_snapshot    (PostToolUse update_plan) extra="c/i/t"
 //   23 = codex_permission       (PermissionRequest) 確認して！
@@ -55,6 +56,10 @@ namespace CodexPetNotify
         // src/Pet.cs / src/Notify.cs の同名定数と文字列を一致させること。
         private const string StructuredObserved = "structured-observed";
 
+        // model identifier の長さ上限。payload は行区切り (4 行) なので
+        // 改行・control 文字は Sanitize で落とす (落とさないと turn_id が壊れる)。
+        private const int MaxModelLen = 40;
+
         // Codex では UserPromptSubmit / PermissionRequest / Stop を sync hook として
         // 登録するため、ペット自動起動の待ち時間は Claude (3秒) より短くする。
         private const int StartWaitMs = 1500;
@@ -98,7 +103,10 @@ namespace CodexPetNotify
                 switch (eventName)
                 {
                     case "UserPromptSubmit":
+                        // Codex はこの hook の共通 input に model を持つ (実測 schema)。
+                        // 新 turn ごとに送るので、空なら Pet 側で 「不明」へ戻る。
                         eventType = EvCodexPromptSubmit;
+                        extra = SanitizeModel(ExtractModelId(json));
                         break;
 
                     case "PostToolUse":
@@ -227,6 +235,37 @@ namespace CodexPetNotify
             Match m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
             if (!m.Success) return "";
             return Unescape(m.Groups[1].Value);
+        }
+
+        // model は "model":"id" の他に "model":{"id":...} 形式もあり得るので
+        // 両方を見る。model 以外の JSON 本文は一切読まない。
+        private static string ExtractModelId(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return "";
+            Match m = Regex.Match(json, "\"model\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            if (m.Success) return Unescape(m.Groups[1].Value);
+            int i = json.IndexOf("\"model\"", StringComparison.Ordinal);
+            if (i < 0) return "";
+            int brace = json.IndexOf('{', i);
+            if (brace < 0 || brace - i > 12) return "";
+            int end = json.IndexOf('}', brace);
+            string region = (end > brace) ? json.Substring(brace, end - brace) : json.Substring(brace);
+            Match id = Regex.Match(region, "\"(?:id|display_name)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            return id.Success ? Unescape(id.Groups[1].Value) : "";
+        }
+
+        // payload の行境界を壊さないよう 改行・control 文字を除去し、長さを制限する。
+        private static string SanitizeModel(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            var sb = new StringBuilder(raw.Length);
+            foreach (char c in raw)
+            {
+                if (c < 0x20 || c == 0x7F) continue; // CR/LF/TAB を含む control 文字
+                sb.Append(c);
+                if (sb.Length >= MaxModelLen) break;
+            }
+            return sb.ToString().Trim();
         }
 
         private static string Unescape(string s)

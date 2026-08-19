@@ -227,6 +227,87 @@ Codex の 5 秒 quiet grace (`CodexQuietGraceMs = 5000`) は理由も値も別�
 今回変えていない。Codex 側の変更は「malformed update_plan でも
 structured-observed を失わない」だけ。
 
+## Provider / model 表示と `+N`
+
+現在表示中の session に、コンパクトな metadata 1 行を出す。
+左に provider + model、右に「他に動いている session 数」を `+N` で表示する。
+
+```
+作業中…
+Claude · Opus 4.6            +2
+claude-desktop-pet
+全体 推定 67%
+● 活動中
+```
+
+### model の取得元 (provider ごとに違う)
+
+- **Codex**: `UserPromptSubmit` の共通 input に `model` がある。新しい event ID は
+  増やさず、既存 event 20 (CodexPromptSubmit) で空いていた `extra` に乗せる。
+  payload は従来どおり 4 行 (session / project / extra / turn)。
+  turn ごとに届くので、空なら前 turn の値を残さず「不明」へ戻す。
+- **Claude**: 公式仕様上、通常の hook の共通 input に model は無く、
+  **`SessionStart` だけ**が受け取る。よって Claude にのみ
+  **正規化イベント 11 = SessionMetadata** を追加した。
+  既存 event 1〜10 の意味と Claude payload 3 行は変えていない。
+
+### SessionStart を表示へ昇格させない
+
+`SessionStart` は `UserPromptSubmit` より先に来るので、これだけで
+「作業中…」を出してはいけない。Session に `MetadataOnly` state を持たせ、
+
+- model を保存するだけ (進捗 / 完了候補 / state は一切触らない)
+- 表示候補にしない (rank 0)
+- `+N` の active にも数えない
+
+とする。compact 等で Working 中の session へ再度来ても model だけ更新する。
+その後 `UserPromptSubmit` が来たら保存済み model をそのまま使う
+(`ModelId` は session 単位なので `ResetRequest()` では消さない)。
+
+### Claude の model は mid-session の変更を即追跡できない (既知制限)
+
+`/model` で途中変更しても、次の SessionStart 相当
+(startup / resume / clear / compact) まで表示が古い可能性がある。
+これを埋めるために transcript 監視 / statusline 乗っ取り / polling /
+API call / 環境変数推測 / 追加 LLM call は導入しない。
+model が確実に取れないときは **provider だけ表示**を優先する。
+
+### model の sanitize と humanize
+
+- adapter 側で `model` field だけを抽出し、control 文字 (CR/LF/TAB 含む) を除去し、
+  40 文字で打ち切る。payload は行区切りなので、これを怠ると Codex の turn_id が壊れる。
+- 表示名の短縮は **存在しないモデル名を作らない**ことを最優先に、
+  確実に分かる形式だけ (`claude-opus-4-6` → `Opus 4.6`、`gpt-` → `GPT-`)。
+  日付 suffix (`-20250805`) はバージョンに含めない。
+  未知の形式は変換せず sanitized raw をそのまま出し、長ければ描画時に ellipsis する。
+
+### `+N` の定義
+
+「現在表示中の session とは別に存在する active session 数」。
+active に数えるのは **Working / Finalizing / Waiting** の 3 つだけ。
+Celebrating / StoppedIncomplete / Indeterminate / MetadataOnly / tombstone は数えない。
+Claude と Codex を合わせた総数で、0 のときは表示しない。
+
+### redraw key
+
+`_shownKey` に provider+model 文字列と `+N` を含める。
+別 session が開始/終了して表示中 session 自体は変わらない場合や、
+SessionStart で model が後から届いた場合も再描画させるため。
+
+### MaxSessions 超過時の evict 優先度
+
+上限 (`MaxSessions`) を超えたときは、まず **MetadataOnly を最古から捨てる**。
+metadata-only が 1 件も無いときだけ従来どおり最古 session を捨てる。
+prompt 未投入の SessionStart が並ぶだけで実作業中の session が
+押し出されるのを避けるため (失うのが model 表示だけで済む方を優先)。
+evict された session から後で UserPromptSubmit が来たら通常の Working として
+再作成され、model 不明なら provider だけ表示になる (model は推測しない)。
+
+### 完了判定への影響
+
+provider / model / session count は **表示だけの情報**で、
+完了判定 (quiet grace / structured tracker / FinalizeDue) には一切関与しない。
+
 ## Nested Claude suppression
 
 - Claude のツール内から `claude -p` 等で起動された子 Claude の hook が

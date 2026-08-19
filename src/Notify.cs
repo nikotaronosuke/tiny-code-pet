@@ -10,6 +10,7 @@
 //   3 = permission_prompt (Notification: settings 側 matcher=permission_prompt で絞る)
 //   4 = activity          (PostToolUse)       ※ Waiting -> Working 解除用
 //   5 = session_end       (SessionEnd)
+//  11 = session_metadata  (SessionStart)      extra=sanitized model identifier
 // payload = "session_id\nproject_name" (UTF-8)
 //
 // 使い方:
@@ -46,6 +47,11 @@ namespace ClaudePetNotify
         private const int EvTaskSnapshot = 8;   // PostToolUse(TodoWrite) から導出した "c/i/t"
         private const int EvTaskRemoved = 9;    // TaskUpdate(deleted/cancelled)。削除はhookが発火しない (実測)
         private const int EvTaskInProgress = 10; // TaskUpdate(in_progress) (extra=task_id)
+        private const int EvSessionMetadata = 11; // SessionStart (extra=model identifier)
+
+        // model identifier の長さ上限。payload は行区切りなので
+        // 改行・control 文字は Sanitize で落とす。
+        private const int MaxModelLen = 40;
 
         // structured tracker (TodoWrite / Task 系) を観測したが status を解析できなかったとき、
         // Activity(4) の extra に載せる固定 marker。本文は一切含まない。
@@ -287,6 +293,13 @@ namespace ClaudePetNotify
                             if (extra.Length == 0) { eventType = EvActivity; extra = StructuredObserved; break; }
                             eventType = EvTaskCompleted;
                             break;
+                        case "SessionStart":
+                            // Claude Code で model を受け取れるのはこの hook だけ (公式仕様)。
+                            // 表示用 metadata だけを送る。source / prompt / transcript は読まない。
+                            if (agentId.Length > 0) return 0; // subagent を root へ混ぜない
+                            extra = SanitizeModel(ExtractModelId(json));
+                            eventType = EvSessionMetadata;
+                            break;
                         case "SessionEnd":
                             eventType = EvSessionEnd;
                             break;
@@ -379,6 +392,37 @@ namespace ClaudePetNotify
             Match m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
             if (!m.Success) return "";
             return Unescape(m.Groups[1].Value);
+        }
+
+        // model は "model":"id" の他に "model":{"id":...} 形式もあり得るので
+        // 両方を見る。model 以外の JSON 本文は一切読まない。
+        private static string ExtractModelId(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return "";
+            Match m = Regex.Match(json, "\"model\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            if (m.Success) return Unescape(m.Groups[1].Value);
+            int i = json.IndexOf("\"model\"", StringComparison.Ordinal);
+            if (i < 0) return "";
+            int brace = json.IndexOf('{', i);
+            if (brace < 0 || brace - i > 12) return "";
+            int end = json.IndexOf('}', brace);
+            string region = (end > brace) ? json.Substring(brace, end - brace) : json.Substring(brace);
+            Match id = Regex.Match(region, "\"(?:id|display_name)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            return id.Success ? Unescape(id.Groups[1].Value) : "";
+        }
+
+        // payload の行境界を壊さないよう 改行・control 文字を除去し、長さを制限する。
+        private static string SanitizeModel(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            var sb = new StringBuilder(raw.Length);
+            foreach (char c in raw)
+            {
+                if (c < 0x20 || c == 0x7F) continue; // CR/LF/TAB を含む control 文字
+                sb.Append(c);
+                if (sb.Length >= MaxModelLen) break;
+            }
+            return sb.ToString().Trim();
         }
 
         private static string Unescape(string s)

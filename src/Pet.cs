@@ -213,6 +213,8 @@ namespace ClaudePet
         public const int TaskSnapshot = 8;      // TodoWrite スナップショット (extra="c/i/t")
         public const int TaskRemoved = 9;       // Task削除/キャンセル (extra=task_id)
         public const int TaskInProgress = 10;   // Task着手 (extra=task_id)
+        public const int SessionMetadata = 11;  // SessionStart (extra=model identifier)
+                                                // 表示用 metadata だけ。進捗・完了判定には影響させない
 
         // --- Codex 専用 (CodexPetNotify.exe)。1〜10 の意味は変更しない ---
         public const int CodexFirst = 20;
@@ -241,6 +243,8 @@ namespace ClaudePet
         public const int StoppedIncomplete = 4; // 明確に未完のまま停止 (「途中で止まったよ」)
         public const int Indeterminate = 5;     // 完了とも未完とも断定できない (「終わったか確認してね」)
         public const int Finalizing = 6;        // Stop受信直後のgrace。遅延した完了イベントを待つ内部状態
+        public const int MetadataOnly = 7;      // SessionStart だけ受けた休眠状態。
+                                                // 表示しないし active にも数えない
 
         public string Project;
         public int State;
@@ -280,6 +284,11 @@ namespace ClaudePet
         // Claude の Finalizing quiet grace 満了時刻 (未設定=MinValue)。
         // Codex の CodexGraceDueUtc とは値も意味も別物なので共通化しない。
         public DateTime ClaudeGraceDueUtc;
+
+        // 表示用 model identifier (sanitize 済み)。空 = 不明。
+        // Claude は SessionStart、Codex は UserPromptSubmit の metadata 由来。
+        // 依頼単位ではなく session 単位なので ResetRequest() では消さない。
+        public string ModelId = "";
 
         public void ResetRequest()
         {
@@ -402,10 +411,10 @@ namespace ClaudePet
             _scale = dpi / 96f;
 
             _winW = S(280); // ピル内テキストの幅で決まる (文字サイズを変えないので不変)
-            // 上余白10 + 最大 Working ピル109 + キャラとの間隔10 + キャラ〜ラベル74。
-            // キャラを半分にした分だけ縮めた (252 -> 204)。キャラは下端基準なので
-            // 画面上の位置は従来と変わらない。
-            _winH = S(204);
+            // 上余白10 + 最大 Working ピル126 + キャラとの間隔10 + キャラ〜ラベル74。
+            // ピルは provider/model の 1 行分 (17) だけ背が高くなった (204 -> 221)。
+            // キャラは下端基準なので画面上の位置は変わらない。
+            _winH = S(221);
 
             Native.RECT work = new Native.RECT();
             Native.SystemParametersInfo(0x0030 /*SPI_GETWORKAREA*/, 0, ref work, 0);
@@ -595,6 +604,16 @@ namespace ClaudePet
                         s.ClaudeGraceDueUtc = DateTime.UtcNow.AddMilliseconds(FinalizeGraceMs);
                     break;
 
+                case PetEvent.SessionMetadata:
+                    // SessionStart。model だけを覚える。UserPromptSubmit より先に来るので
+                    // これだけでは「作業中…」を出さないし active にも数えない。
+                    // 既存 session へ compact 等で再度来ても state / 進捗 / 完了候補は触らない。
+                    if (s == null && IsTombstoned(sessionId)) return;
+                    s = Upsert(sessionId, s, project, false);
+                    if (s.State == 0) s.State = Session.MetadataOnly;
+                    s.ModelId = extra;
+                    break;
+
                 case PetEvent.PermissionPrompt:
                     _recentlyEnded.Remove(sessionId); // 正当な再開
                     bool wasWaiting = (s != null && s.State == Session.Waiting);
@@ -690,6 +709,8 @@ namespace ClaudePet
                     s.TurnHasSubagent = false;
                     s.CodexGraceDueUtc = DateTime.MinValue;
                     s.LastActivityUtc = DateTime.MinValue;
+                    // model は turn ごとに届く。空なら前 turn の値を残さず不明へ戻す。
+                    s.ModelId = extra;
                     break;
 
                 case PetEvent.CodexActivity:
@@ -952,16 +973,28 @@ namespace ClaudePet
                 }
             }
 
+            // 上限超過時はまず「表示用 metadata しか持たない session」を捨てる。
+            // 失うのは model 表示だけで済むが、実作業中の session を
+            // metadata のために失うと通知そのものが消えるため。
             while (_sessions.Count > MaxSessions)
             {
-                string oldest = null;
-                long oldestSeq = long.MaxValue;
+                string victim = null;
+                long victimSeq = long.MaxValue;
                 foreach (var kv in _sessions)
                 {
-                    if (kv.Value.LastSeq < oldestSeq) { oldestSeq = kv.Value.LastSeq; oldest = kv.Key; }
+                    if (kv.Value.State != Session.MetadataOnly) continue;
+                    if (kv.Value.LastSeq < victimSeq) { victimSeq = kv.Value.LastSeq; victim = kv.Key; }
                 }
-                if (oldest == null) break;
-                _sessions.Remove(oldest);
+                if (victim == null)
+                {
+                    // metadata-only が 1 件も無いときだけ従来どおり最古を捨てる
+                    foreach (var kv in _sessions)
+                    {
+                        if (kv.Value.LastSeq < victimSeq) { victimSeq = kv.Value.LastSeq; victim = kv.Key; }
+                    }
+                }
+                if (victim == null) break;
+                _sessions.Remove(victim);
             }
         }
 
@@ -974,6 +1007,7 @@ namespace ClaudePet
             foreach (var kv in _sessions)
             {
                 int rank = RankOf(kv.Value.State);
+                if (rank <= 0) continue; // metadata-only 等は表示候補にしない
                 if (rank > bestRank || (rank == bestRank && kv.Value.LastSeq > bestSeq))
                 {
                     bestRank = rank;
@@ -982,6 +1016,27 @@ namespace ClaudePet
                 }
             }
             return bestId;
+        }
+
+        // 「他に動いている session」の数え方。作業中と見なせる state だけ。
+        // 終了表示 (Celebrating / StoppedIncomplete / Indeterminate) と
+        // metadata-only は含めない。
+        private static bool IsActive(int state)
+        {
+            return state == Session.Working || state == Session.Finalizing ||
+                   state == Session.Waiting;
+        }
+
+        // 現在表示中の session 以外で active な session 数。
+        private int OtherActiveCount(string shownId)
+        {
+            int n = 0;
+            foreach (var kv in _sessions)
+            {
+                if (kv.Key == shownId) continue;
+                if (IsActive(kv.Value.State)) n++;
+            }
+            return n;
         }
 
         private static int RankOf(int state)
@@ -994,6 +1049,7 @@ namespace ClaudePet
                 case Session.Celebrating: return 2;
                 case Session.Working: return 1;
                 case Session.Finalizing: return 1; // ユーザーには Working として見せる
+                case Session.MetadataOnly: return 0; // 表示しない
                 default: return 0;
             }
         }
@@ -1020,18 +1076,26 @@ namespace ClaudePet
                 }
             }
 
+            // provider + model の 1 行と、他に動いている session 数。
+            // どちらも完了判定には一切影響しない表示だけの情報。
+            string meta = (s == null) ? "" : PetRenderer.MetaLine(s.IsCodex, s.ModelId);
+            int others = (s == null) ? 0 : OtherActiveCount(id);
+
+            // 別 session の開始/終了で +N だけが変わる場合や、後から model が
+            // 届いた場合も再描画させるため、key に含める。
             string key = (s == null) ? "idle"
-                : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + pct + "|" + (active ? 1 : 0);
+                : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + pct + "|" + (active ? 1 : 0)
+                  + "|" + meta + "|" + others;
             if (!force && key == _shownKey) return; // 同一表示なら再描画しない (PostToolUse連発対策)
             _shownKey = key;
 
             Bitmap bmp;
             if (s == null) bmp = PetRenderer.RenderIdle(_winW, _winH, _scale);
-            else if (s.State == Session.Waiting) bmp = PetRenderer.RenderWaiting(_winW, _winH, _scale, s.Project);
-            else if (s.State == Session.StoppedIncomplete) bmp = PetRenderer.RenderStopped(_winW, _winH, _scale, s.Project);
-            else if (s.State == Session.Indeterminate) bmp = PetRenderer.RenderIndeterminate(_winW, _winH, _scale, s.Project);
-            else if (s.State == Session.Celebrating) bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project);
-            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct, active);
+            else if (s.State == Session.Waiting) bmp = PetRenderer.RenderWaiting(_winW, _winH, _scale, s.Project, meta, others);
+            else if (s.State == Session.StoppedIncomplete) bmp = PetRenderer.RenderStopped(_winW, _winH, _scale, s.Project, meta, others);
+            else if (s.State == Session.Indeterminate) bmp = PetRenderer.RenderIndeterminate(_winW, _winH, _scale, s.Project, meta, others);
+            else if (s.State == Session.Celebrating) bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project, meta, others);
+            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct, active, meta, others);
 
             using (bmp) { ApplyBitmap(bmp, _baseX, _baseY); }
 
@@ -1280,19 +1344,21 @@ namespace ClaudePet
         // Working: 吹き出しなしの控えめなピル + 「作業中…」。
         // pct>=0 のときだけ依頼全体の推定進捗 (bar + 全体 推定N%) を追加表示する。
         // Task 件数 (3/5 等) は表示しない。active=true で「● 活動中」を添える。
-        public static Bitmap RenderWorking(int w, int h, float scale, string project, int pct, bool active)
+        public static Bitmap RenderWorking(int w, int h, float scale, string project, int pct, bool active,
+            string meta, int otherActive)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawWorkingPill(g, w, h, scale, project, pct, active);
+                DrawWorkingPill(g, w, h, scale, project, pct, active, meta, otherActive);
             }
             return bmp;
         }
 
         // 完了とも未完とも断定できない: 曖昧なまま確認を促す
-        public static Bitmap RenderIndeterminate(int w, int h, float scale, string project)
+        public static Bitmap RenderIndeterminate(int w, int h, float scale, string project,
+            string meta, int otherActive)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
@@ -1302,13 +1368,14 @@ namespace ClaudePet
                     Color.FromArgb(242, 255, 248, 228),   // 背景: 淡い黄 (Waiting より薄い)
                     Color.FromArgb(255, 214, 178, 96),    // 枠: 薄いオレンジ
                     Color.FromArgb(255, 150, 110, 40),    // 文字: 茶寄りオレンジ
-                    true, 14.5f);
+                    true, 14.5f, meta, otherActive);
             }
             return bmp;
         }
 
         // Stop したが Todo 未完: 完了とは言わない控えめな注意表示
-        public static Bitmap RenderStopped(int w, int h, float scale, string project)
+        public static Bitmap RenderStopped(int w, int h, float scale, string project,
+            string meta, int otherActive)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
@@ -1318,13 +1385,14 @@ namespace ClaudePet
                     Color.FromArgb(242, 245, 236, 226),   // 背景: 淡いベージュ
                     Color.FromArgb(255, 196, 156, 108),   // 枠: 茶系
                     Color.FromArgb(255, 140, 96, 48),     // 文字: 濃い茶
-                    true, 16f);
+                    true, 16f, meta, otherActive);
             }
             return bmp;
         }
 
         // Working 用ピル: 作業中… / [progress bar + 全体 推定 N%] / [● 活動中] / [project]
-        private static void DrawWorkingPill(Graphics g, int w, int h, float scale, string project, int pct, bool active)
+        private static void DrawWorkingPill(Graphics g, int w, int h, float scale, string project, int pct, bool active,
+            string meta, int otherActive)
         {
             Color bg = Color.FromArgb(205, 250, 250, 248);
             Color border = Color.FromArgb(255, 210, 205, 196);
@@ -1335,7 +1403,12 @@ namespace ClaudePet
             Color activeColor = Color.FromArgb(255, 74, 152, 88);
 
             bool hasProject = !string.IsNullOrEmpty(project);
-            float cursor = (pct >= 0) ? 66f : 32f; // ヘッダ (+bar+%) の下端
+            bool hasMeta = !string.IsNullOrEmpty(meta);
+            float metaY = 30f;                       // ヘッダ直下
+            float metaH = hasMeta ? 17f : 0f;        // 以降の行をその分だけ下へ
+            float barY = 33f + metaH;
+            float pctY = 45f + metaH;
+            float cursor = ((pct >= 0) ? 66f : 32f) + metaH; // ヘッダ (+meta+bar+%) の下端
             float actY = cursor;
             if (active) cursor += 17f;
             float projY = cursor;
@@ -1362,14 +1435,16 @@ namespace ClaudePet
                 using (var brush = new SolidBrush(textColor))
                     g.DrawString("作業中…", font, brush, w / 2f, by + 8 * scale, fmt);
 
+                DrawMetaLine(g, bx, bw, scale, by + metaY * scale, meta, otherActive, subColor, textColor);
+
                 if (pct >= 0)
                 {
                     // progress bar (常時animationなし。イベント時の再描画のみ)
                     float barW = bw - 56 * scale;
                     float barH = 8 * scale;
                     float barX = w / 2f - barW / 2f;
-                    float barY = by + 33 * scale;
-                    using (GraphicsPath track = RoundedRect(barX, barY, barW, barH, barH / 2f))
+                    float barYAbs = by + barY * scale;
+                    using (GraphicsPath track = RoundedRect(barX, barYAbs, barW, barH, barH / 2f))
                     using (var trackBrush = new SolidBrush(trackColor))
                         g.FillPath(trackBrush, track);
                     float ratio = pct / 100f;
@@ -1377,14 +1452,14 @@ namespace ClaudePet
                     float fillW = barW * ratio;
                     if (fillW >= barH) // 極端に短いと角丸が破綻するため最小幅まで描かない
                     {
-                        using (GraphicsPath fill = RoundedRect(barX, barY, fillW, barH, barH / 2f))
+                        using (GraphicsPath fill = RoundedRect(barX, barYAbs, fillW, barH, barH / 2f))
                         using (var fillBrush = new SolidBrush(fillColor))
                             g.FillPath(fillBrush, fill);
                     }
 
                     using (var font = new Font("Yu Gothic UI", 13.5f * scale, FontStyle.Bold, GraphicsUnit.Pixel))
                     using (var brush = new SolidBrush(textColor))
-                        g.DrawString("全体 推定 " + pct + "%", font, brush, w / 2f, by + 45 * scale, fmt);
+                        g.DrawString("全体 推定 " + pct + "%", font, brush, w / 2f, by + pctY * scale, fmt);
                 }
 
                 if (active)
@@ -1405,7 +1480,8 @@ namespace ClaudePet
         }
 
         // Waiting: 警告色の吹き出し + 「確認して！」 (完了と明確に区別)
-        public static Bitmap RenderWaiting(int w, int h, float scale, string project)
+        public static Bitmap RenderWaiting(int w, int h, float scale, string project,
+            string meta, int otherActive)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
@@ -1415,12 +1491,13 @@ namespace ClaudePet
                     Color.FromArgb(242, 255, 243, 214),   // 背景: 淡い黄
                     Color.FromArgb(255, 226, 160, 66),    // 枠: オレンジ
                     Color.FromArgb(255, 168, 96, 24),     // 文字: 濃いオレンジ
-                    true, 18f);
+                    true, 18f, meta, otherActive);
             }
             return bmp;
         }
 
-        public static Bitmap RenderCelebrate(int w, int h, float scale, string project)
+        public static Bitmap RenderCelebrate(int w, int h, float scale, string project,
+            string meta, int otherActive)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
@@ -1430,9 +1507,101 @@ namespace ClaudePet
                     Color.FromArgb(238, 255, 255, 255),   // 背景: 白
                     Color.FromArgb(255, 205, 198, 188),   // 枠: グレー
                     Color.FromArgb(255, 70, 62, 54),      // 文字: 濃いグレー
-                    true, 19f);
+                    true, 19f, meta, otherActive);
             }
             return bmp;
+        }
+
+        // provider + model の 1 行。model 不明なら provider だけ。
+        public static string MetaLine(bool isCodex, string modelId)
+        {
+            string provider = isCodex ? "Codex" : "Claude";
+            string model = HumanizeModel(modelId == null ? "" : modelId.Trim());
+            return (model.Length == 0) ? provider : provider + " · " + model;
+        }
+
+        // 存在しないモデル名を作らないことを最優先する。
+        // 確実に分かる形式だけ短くし、未知の形式はそのまま出す。
+        public static string HumanizeModel(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return "";
+            string low = id.ToLowerInvariant();
+            if (low.StartsWith("claude-"))
+            {
+                string[] parts = low.Substring(7).Split('-');
+                string fam = (parts.Length > 0) ? parts[0] : "";
+                if (fam == "opus" || fam == "sonnet" || fam == "haiku")
+                {
+                    string name = char.ToUpperInvariant(fam[0]) + fam.Substring(1);
+                    var nums = new List<string>();
+                    for (int i = 1; i < parts.Length; i++)
+                    {
+                        // 20250805 のような日付 suffix はバージョンに含めない
+                        if (!IsDigits(parts[i]) || parts[i].Length >= 6) break;
+                        nums.Add(parts[i]);
+                    }
+                    if (nums.Count == 0) return name;
+                    return name + " " + string.Join(".", nums.ToArray());
+                }
+                return id; // 未知の claude-* は変換しない
+            }
+            if (low.StartsWith("gpt-")) return "GPT" + id.Substring(3);
+            return id;
+        }
+
+        private static bool IsDigits(string t)
+        {
+            if (t.Length == 0) return false;
+            for (int i = 0; i < t.Length; i++) if (t[i] < '0' || t[i] > '9') return false;
+            return true;
+        }
+
+        // maxW に収まるまで末尾を削って … を付ける
+        private static string FitText(Graphics g, string text, Font font, float maxW)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            if (g.MeasureString(text, font).Width <= maxW) return text;
+            for (int len = text.Length - 1; len > 0; len--)
+            {
+                string t = text.Substring(0, len) + "…";
+                if (g.MeasureString(t, font).Width <= maxW) return t;
+            }
+            return "…";
+        }
+
+        // 左: provider · model (長ければ ellipsis) / 右: +N。
+        // +N の幅を先に確保してから左を収めるので重ならない。
+        private static void DrawMetaLine(Graphics g, float bx, float bw, float scale, float y,
+            string meta, int otherActive, Color metaColor, Color countColor)
+        {
+            if (string.IsNullOrEmpty(meta)) return;
+            float pad = 14 * scale;
+            float left = bx + pad;
+            float right = bx + bw - pad;
+            using (var font = new Font("Yu Gothic UI", 11.5f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var countFont = new Font("Yu Gothic UI", 11.5f * scale, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (var fmt = new StringFormat())
+            {
+                fmt.Alignment = StringAlignment.Near;
+                float reserved = 0f;
+                string count = null;
+                if (otherActive > 0)
+                {
+                    count = "+" + otherActive;
+                    reserved = g.MeasureString(count, countFont).Width + 6 * scale;
+                }
+                string shown = FitText(g, meta, font, (right - left) - reserved);
+                using (var brush = new SolidBrush(metaColor))
+                    g.DrawString(shown, font, brush, left, y, fmt);
+                if (count != null)
+                {
+                    var rfmt = new StringFormat();
+                    rfmt.Alignment = StringAlignment.Far;
+                    using (rfmt)
+                    using (var brush = new SolidBrush(countColor))
+                        g.DrawString(count, countFont, brush, right, y, rfmt);
+                }
+            }
         }
 
         private static Bitmap NewCanvas(int w, int h)
@@ -1529,12 +1698,15 @@ namespace ClaudePet
 
         // キャラ上部の吹き出し/ピル。tail=true で吹き出しのしっぽ付き。
         private static void DrawPill(Graphics g, int w, int h, float scale, string mainText, string project,
-            Color bg, Color border, Color textColor, bool tail, float mainSize)
+            Color bg, Color border, Color textColor, bool tail, float mainSize,
+            string meta, int otherActive)
         {
             float bx = 24 * scale;
             float bw = w - 48 * scale;
             bool hasProject = !string.IsNullOrEmpty(project);
-            float bh = (hasProject ? 76 : 56) * scale;
+            bool hasMeta = !string.IsNullOrEmpty(meta);
+            float metaH = hasMeta ? 17f : 0f;
+            float bh = ((hasProject ? 76 : 56) + metaH) * scale;
             float rad = 12 * scale;
             // しっぽの先がキャラの頭上に来るよう下端基準で配置する。
             float tailH = tail ? 10 * scale : 0f;
@@ -1567,12 +1739,15 @@ namespace ClaudePet
                 {
                     g.DrawString(mainText, font, brush, w / 2f, mainY, fmt);
                 }
+                DrawMetaLine(g, bx, bw, scale, by + 38 * scale, meta, otherActive,
+                    Color.FromArgb(255, 130, 122, 112), textColor);
+
                 if (hasProject)
                 {
                     using (var font = new Font("Yu Gothic UI", 13f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
                     using (var brush = new SolidBrush(Color.FromArgb(255, 130, 122, 112)))
                     {
-                        g.DrawString(project, font, brush, w / 2f, by + 42 * scale, fmt);
+                        g.DrawString(project, font, brush, w / 2f, by + (42 + metaH) * scale, fmt);
                     }
                 }
             }

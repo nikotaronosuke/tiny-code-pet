@@ -1,5 +1,6 @@
 # install-hook.ps1 - Register ClaudePetNotify.exe hooks in user-level Claude Code settings.
-# Events: Stop, UserPromptSubmit, Notification(permission_prompt), PostToolUse(*), SessionEnd.
+# Events: Stop, UserPromptSubmit, Notification(permission_prompt), PostToolUse(*),
+#         SessionStart (model metadata), SessionEnd.
 # - Never overwrites existing hooks: appends only, idempotent per event.
 # - Creates a timestamped backup of settings.json first.
 # NOTE: keep this file ASCII-only. Prefer running with pwsh (PowerShell 7).
@@ -45,6 +46,7 @@ $events = [ordered]@{
     "UserPromptSubmit" = $null
     "Notification"     = "permission_prompt"
     "PostToolUse"      = "*"
+    "SessionStart"     = $null
     "SessionEnd"       = $null
     "TaskCreated"      = $null
     "TaskCompleted"    = $null

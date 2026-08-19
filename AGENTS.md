@@ -69,6 +69,8 @@ Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節�
   - nested Claude suppression を変えない。
   - status 本文 (Todo/Task/plan step/command/response) を読まない。
   - `structured-observed` は固定 metadata のみ。本文を乗せない。
+  - event 11 (SessionStart) は model 表示用 metadata 専用。これだけで
+    「作業中…」にしないし active session にも数えない。
   - `FinalizeGraceMs = 2000` (Claude の quiet grace) を理由なく変えない。
   - root Stop は常に Finalizing へ入る。grace 中の関連イベントで deadline を
     延長し、completion を決めるのは `FinalizeDue` だけ (早期 celebration 禁止)。
