@@ -46,7 +46,7 @@ jobs:
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: AgentPet-windows-build
+          name: Tiny-Code-Pet-windows-build
           path: |
             bin/ClaudePet.exe
             bin/ClaudePetNotify.exe

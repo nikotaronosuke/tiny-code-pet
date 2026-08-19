@@ -387,7 +387,7 @@ structured-observed を失わない」だけ。
 ```
 作業中…
 Claude · Opus 4.6            +2
-agent-desktop-pet
+tiny-code-pet
 全体 推定 67%
 ```
 

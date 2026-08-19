@@ -1,5 +1,5 @@
-// AgentPet - 常駐デスクトップペット本体 (binary 名は ClaudePet.exe)
-// 公開上の製品名は AgentPet。exe 名 / class 名 / namespace / WndClassName /
+// Tiny Code Pet - 常駐デスクトップペット本体 (binary 名は ClaudePet.exe)
+// 公開上の製品名は Tiny Code Pet。exe 名 / class 名 / namespace / WndClassName /
 // mutex 名は既存 hooks と install script との互換のため ClaudePet* のまま。
 // 純Win32 (P/Invoke) + layered window。アイドル時は GetMessage でブロックし CPU 0%。
 // 描画は System.Drawing で ARGB ビットマップを合成し UpdateLayeredWindow で反映。
@@ -535,7 +535,7 @@ namespace ClaudePet
             _hwnd = Native.CreateWindowEx(
                 Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT | Native.WS_EX_TOOLWINDOW |
                 Native.WS_EX_NOACTIVATE | Native.WS_EX_TOPMOST,
-                WndClassName, "AgentPet", Native.WS_POPUP,
+                WndClassName, "Tiny Code Pet", Native.WS_POPUP,
                 _baseX, _baseY, _winW, _winH,
                 IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
 
@@ -1404,7 +1404,7 @@ namespace ClaudePet
                 nid.uFlags = Native.NIF_MESSAGE | Native.NIF_ICON | Native.NIF_TIP;
                 nid.uCallbackMessage = WmTrayIcon;
                 nid.hIcon = _trayIconHandle;
-                nid.szTip = "AgentPet"; // 静的 tooltip のみ。作業内容は載せない (privacy)
+                nid.szTip = "Tiny Code Pet"; // 静的 tooltip のみ。作業内容は載せない (privacy)
                 _trayAdded = Native.Shell_NotifyIcon(Native.NIM_ADD, ref nid);
                 PetDebug("tray: add " + (_trayAdded ? "ok" : "failed err=" + Marshal.GetLastWin32Error()));
             }
@@ -1461,7 +1461,7 @@ namespace ClaudePet
                     (uint)CmdHidePet, "ヒヨコを隠す");
                 Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdBringToFront, "最前面に戻す");
                 Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
-                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "AgentPetを終了");
+                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "Tiny Code Petを終了");
 
                 Native.POINT pt;
                 Native.GetCursorPos(out pt);
@@ -1544,7 +1544,7 @@ namespace ClaudePet
             using (Graphics g = NewGraphics(bmp))
             {
                 DrawChick(g, w, h, scale);
-                DrawLabel(g, w, h, scale, "AgentPet");
+                DrawLabel(g, w, h, scale, "Tiny Code Pet");
             }
             return bmp;
         }

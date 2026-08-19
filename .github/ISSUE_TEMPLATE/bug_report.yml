@@ -1,11 +1,11 @@
 name: Bug report
-description: Something in AgentPet does not behave as documented
+description: Something in Tiny Code Pet does not behave as documented
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report. AgentPet is a small personal tool, so please
+        Thanks for the report. Tiny Code Pet is a small personal tool, so please
         include enough detail to reproduce the behaviour on another machine.
 
   - type: textarea
@@ -40,7 +40,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: AgentPet version / commit
+      label: Tiny Code Pet version / commit
       description: Release tag (e.g. v1.0.0) or the commit SHA you built from.
       placeholder: v1.0.0
     validations:

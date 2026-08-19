@@ -1,6 +1,6 @@
-# AgentPet 🐣
+# Tiny Code Pet 🐣
 
-[![Build](https://github.com/nikotaronosuke/agent-desktop-pet/actions/workflows/build.yml/badge.svg)](https://github.com/nikotaronosuke/agent-desktop-pet/actions/workflows/build.yml)
+[![Build](https://github.com/nikotaronosuke/tiny-code-pet/actions/workflows/build.yml/badge.svg)](https://github.com/nikotaronosuke/tiny-code-pet/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 
@@ -10,7 +10,7 @@ Claude Code / Codex の作業状況・依頼全体の推定進捗・作業終了
 画面右下の小さなひよこで確認できる **超軽量 Windows デスクトップ Pet** です。
 Claude Code と Codex を同時に使っても session / 状態は衝突しません。
 
-![AgentPet preview](docs/assets/agentpet-preview.png)
+![Tiny Code Pet preview](docs/assets/tiny-code-pet-preview.png)
 
 **一目でわかる特徴**
 
@@ -31,7 +31,7 @@ Claude Code と Codex を同時に使っても session / 状態は衝突しま�
 
 | 状態 | 表示 | 意味 |
 |---|---|---|
-| Idle | 🐣 + `AgentPet` | 何もしていない。完全静止 |
+| Idle | 🐣 + `Tiny Code Pet` | 何もしていない。完全静止 |
 | 作業中 | 🐣 + 「作業中…」(+ 「**全体 推定 N%**」) + project名 | 放置してよい。permission 待ちも、Stop 後の静穏待ちも、すべてこの表示 |
 | 完了 | 🐣 + 「終わったよ！」+ project名 | root Stop の後 20 秒間その作業が再開されなかった (3回ピョコピョコ・通知音1回・約5秒後に Idle) |
 
@@ -49,7 +49,7 @@ Working / Finalizing / Waiting の session だけを数える (0 なら非表示
 - Native Win32 (C# P/Invoke)。**Electron / WebView / Node 常駐 / localhost サーバー / DB 一切なし**
 - 完全 event-driven (Claude Code 公式 Hooks 連携)。polling なし。アイドル時は `GetMessage` でブロック
 - 背景完全透過・枠なし・タスクバー/Alt+Tab 非表示・常に最前面
-  (通常ウィンドウより前。OS に topmost を剥がされても表示更新時に自動復帰)
+  (通常ウィンドウより前。TOPMOST を失っても表示更新時に自動復帰)
 - **クリック透過**: キャラの背後にある VS Code や Chrome をそのまま操作できる
 - **通知領域 (system tray) の 🐥 アイコン**から 表示 / 隠す / 最前面に戻す / 終了 を操作
 - 依頼全体の推定進捗表示 (新 Task システム / TodoWrite の両対応)
@@ -107,7 +107,7 @@ ClaudePet.exe         … 同じ常駐ペット。provider + session + turn で�
 ```
 
 - 実装: C# (P/Invoke による純 Win32)。**.NET Framework 4.8 同梱の csc.exe でビルドするため追加インストール不要**
-- タイマーはアニメーション・grace・表示期限の one-shot のみ。常時タイマーなし
+- タイマーはアニメーション・quiet window・表示期限の one-shot のみ。常時タイマーなし
 - 通知領域アイコンは `Shell_NotifyIcon` (純 Win32)。アイコン画像も実行時に
   System.Drawing で描く (外部画像ファイルなし)。taskbar ボタンや Alt+Tab には出ない
 - ペット未起動時は Stop / UserPromptSubmit / permission_prompt で自動起動 (高頻度な PostToolUse では起動しない)
@@ -218,7 +218,7 @@ VS Code で入力中に Pet の表示が切り替わっても入力先は変わ�
 | 操作 | 動作 |
 |---|---|
 | 左クリック | 最前面へ復帰 (hidden なら再表示 + 最新 state 描画 + 最前面) |
-| 右クリック | menu: ヒヨコを表示 / ヒヨコを隠す / 最前面に戻す / AgentPetを終了 |
+| 右クリック | menu: ヒヨコを表示 / ヒヨコを隠す / 最前面に戻す / Tiny Code Petを終了 |
 
 「ヒヨコを隠す」は **visual hide** であって監視停止ではない。hidden 中も
 hooks 受信・進捗更新・完了判定・session 管理はすべて継続し、再表示した
@@ -335,7 +335,8 @@ async はあくまで性能最適化であり、sync になっても正しさは
   tool event が root のものか subagent のものかを metadata だけで証明できない。
 - よって fail-closed: `SubagentStart` を検知した turn では
   **その turn の進捗を信用せず % を表示しない** (表示中のものも消す)。
-  `SubagentStop` を root の完了にはしない。tool activity 表示には使う。
+  `SubagentStop` を root の完了にはしない。ただし同一 turn の
+  work continuation として completion candidate の取消には使う。
 - subagent の進捗のためだけに rollout watcher / App Server 常駐は導入しない。
 
 ## Privacy / Security
@@ -365,8 +366,8 @@ Claude Code だけ / Codex だけ / 両方、どの構成でも使えます。
 
 ### Option 1: Download release (おすすめ)
 
-1. [Releases](https://github.com/nikotaronosuke/agent-desktop-pet/releases) から
-   `AgentPet-v1.0.0-windows.zip` をダウンロードして展開
+1. [Releases](https://github.com/nikotaronosuke/tiny-code-pet/releases) から
+   `Tiny-Code-Pet-v1.0.0-windows.zip` をダウンロードして展開
 2. hook を登録する
 
 ```powershell
@@ -381,8 +382,8 @@ pwsh -File install-codex-hook.ps1   # Codex 用 (先に -DryRun で差分確認�
 ### Option 2: Build from source
 
 ```powershell
-git clone https://github.com/nikotaronosuke/agent-desktop-pet.git
-cd agent-desktop-pet
+git clone https://github.com/nikotaronosuke/tiny-code-pet.git
+cd tiny-code-pet
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
@@ -395,7 +396,7 @@ Visual Studio や .NET SDK は不要です。
 Codex 側の詳細は「Codex 対応 › Setup」を参照 (`install-codex-hook.ps1`)。
 
 > **Note**
-> 公開上の製品名は **AgentPet** ですが、binary 名は既存の hook 設定・
+> 公開上の製品名は **Tiny Code Pet** ですが、binary 名は既存の hook 設定・
 > install script との互換性のため `ClaudePet.exe` / `ClaudePetNotify.exe` /
 > `CodexPetNotify.exe` のままです (rename 漏れではありません)。
 > WndClass 名・mutex 名・WM_COPYDATA プロトコルも同じ理由で変更していません。

@@ -1,4 +1,4 @@
-# agent-desktop-pet (AgentPet) — Project Instructions (Claude Code / Codex 共通)
+# tiny-code-pet (Tiny Code Pet) — Project Instructions (Claude Code / Codex 共通)
 
 このファイルが project 固有ルールの正本。全 project 共通ルール
 (Git 安全運用・secret 非表示・スコープ規律等) は global の
