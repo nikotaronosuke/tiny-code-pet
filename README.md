@@ -231,8 +231,13 @@ tray の追加に失敗しても Pet 本体は通常動作する (fail-soft)。
 メイン Claude が Bash/PowerShell tool 内から起動した `claude -p` などの子 Claude は、
 **プロセス祖先チェーン**で検出して UI 通知を完全に抑制する。
 
-- 判定: hook helper の祖先プロセスに claude 本体が2つ以上あるか
-  (1つ目 = hook を発火させた claude 自身、2つ目 = それを起動した親 Claude)
+- 判定: hook helper の祖先プロセスに claude 本体が2グループ以上あるか
+  (1グループ目 = hook を発火させた claude 自身、2グループ目 = それを起動した親 Claude)
+- 直接の親子として連続する claude は 1 グループと数える。Claude Code Desktop は
+  `Claude.exe` (アプリ) → `claude.exe` (Claude Code エンジン) の直結親子から hook を
+  発火させるため、グループ化しないと Desktop の root セッションまで nested 扱いに
+  なり通知が全て消える (実測)。本物の nested 子 Claude は間に tool のシェル
+  (pwsh/bash 等) を挟むためグループが分かれ、従来どおり抑制される
 - PID 再利用による誤判定は「親の起動時刻 <= 子の起動時刻」検証で排除
 - 手動で開いた別ウィンドウの Claude は祖先に claude がいないため抑制されない
 
@@ -355,7 +360,8 @@ async はあくまで性能最適化であり、sync になっても正しさは
 
 - Windows 10 / 11 (x64)
 - .NET Framework 4.8 (Windows 10/11 に標準搭載。追加インストール不要)
-- [Claude Code](https://claude.com/claude-code) (Hooks 対応バージョン。v2.1.233 で開発・検証)
+- [Claude Code](https://claude.com/claude-code) (Hooks 対応バージョン。CLI / VS Code は
+  v2.1.233、Claude Code Desktop はアプリ 1.37937 + エンジン v2.1.246 で開発・検証)
 - (任意) Codex — Hooks 対応バージョン。VS Code 拡張 26.814.41407 /
   Codex CLI 0.148.0-alpha.15 で仕様を実測して実装
 

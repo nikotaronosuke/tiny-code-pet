@@ -530,6 +530,16 @@ hide しても process・HWND・mutex・session 管理・hooks 受信・完了�
   失うより誤通知の方がまし、ではなく「不確実なら抑制しない」)。
 - 既知の限界: 中間シェルが先に終了するとチェーンが切れる /
   exe 名が claude でない起動形態は検出不可 (README Limitations 参照)。
+- **Claude Code Desktop の直結親子は nested ではない (2026-08-27)**: Desktop は
+  `Claude.exe` (アプリ) → `claude.exe` (Claude Code エンジン) の直接の親子から
+  hook を発火させるため、当初の「claude 個数 >= 2」判定では Desktop の root
+  セッションまで nested 扱いになり、全イベントが抑制されていた
+  (`bin\debug.flag` での実測: `suppressed:nested ev=PostToolUse`)。
+  counting を「**連続して隣接する claude は 1 グループ、グループ数 >= 2 で
+  nested**」へ変更した。本物の nested 子 Claude は必ず間に tool のシェル
+  (pwsh/bash 等) を挟んでグループが分かれるため、CLI / VS Code / Desktop の
+  どの親からの nested も従来どおり抑制される。Desktop 固有の識別子・環境変数
+  には依存しない (環境判定そのものを不要にする)。
 - テスト時の注意: 独立セッションを装うには WMI
   (Invoke-CimMethod Win32_Process Create) で起動する必要がある
   (通常のツール実行だと自分の子になり抑制されてしまう)。

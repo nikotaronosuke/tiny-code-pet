@@ -111,10 +111,15 @@ namespace ClaudePetNotify
         [DllImport("kernel32.dll")]
         private static extern bool GetProcessTimes(IntPtr hProcess, out long creation, out long exit, out long kernel, out long user);
 
-        // 祖先チェーンに claude 本体が2つ以上あれば nested。
-        // 1つ目 = この hook を発火させた claude 自身、2つ目以降 = それを tool 内から
-        // 起動した別の Claude セッション。PID 再利用による誤判定は
-        // 「親の起動時刻 <= 子の起動時刻」検証で排除する。
+        // 祖先チェーンに claude 本体が「2グループ以上」あれば nested。
+        // 1グループ目 = この hook を発火させた claude 自身、2グループ目以降 = それを
+        // tool 内から起動した別の Claude セッション。
+        // 直接の親子として連続する claude は 1 グループと数える: Claude Code Desktop は
+        // Claude.exe (アプリ) -> claude.exe (エンジン) の直結親子から hook を発火させる
+        // ため、個数で数えると Desktop の root セッションまで nested 扱いになる (実測)。
+        // 本物の nested 子 Claude は必ず間に tool のシェル (pwsh/bash 等) を挟むので
+        // グループが分かれ、従来どおり抑制される。
+        // PID 再利用による誤判定は「親の起動時刻 <= 子の起動時刻」検証で排除する。
         private static bool IsNestedClaude()
         {
             try
@@ -139,7 +144,8 @@ namespace ClaudePetNotify
                 }
                 finally { CloseHandle(snap); }
 
-                int claudeCount = 0;
+                int claudeGroups = 0;
+                bool prevWasClaude = false; // 直前 (1 hop 子側) の祖先が claude だったか
                 uint pid = (uint)Process.GetCurrentProcess().Id;
                 long childStart = StartTimeOf(pid);
                 var visited = new System.Collections.Generic.HashSet<uint>();
@@ -156,11 +162,13 @@ namespace ClaudePetNotify
                     if (parentStart == 0 || (childStart != 0 && parentStart > childStart)) break;
 
                     string n = pname.ToLowerInvariant();
-                    if (n == "claude.exe" || n == "claude")
+                    bool isClaude = (n == "claude.exe" || n == "claude");
+                    if (isClaude && !prevWasClaude)
                     {
-                        claudeCount++;
-                        if (claudeCount >= 2) return true;
+                        claudeGroups++;
+                        if (claudeGroups >= 2) return true;
                     }
+                    prevWasClaude = isClaude;
                     pid = ppid;
                     childStart = parentStart;
                 }
@@ -221,8 +229,9 @@ namespace ClaudePetNotify
 
                     // Nested child Claude 判定 (プロセス祖先チェーン方式):
                     // この helper の親プロセスは hook を発火させた claude 本体。その祖先に
-                    // さらに別の claude が居れば、「別の Claude セッションの tool 内から起動
-                    // された子 Claude」と確実に判断できるので、UI へは一切流さない。
+                    // さらに別の claude グループが居れば、「別の Claude セッションの tool 内
+                    // から起動された子 Claude」と確実に判断できるので、UI へは一切流さない。
+                    // (Claude Code Desktop の Claude.exe -> claude.exe 直結親子は同一グループ)
                     // 手動起動の独立セッション (VS Code / terminal 直下) は祖先に claude が
                     // 居ないので抑制されない。環境変数は親子で同一値になるため使えない (実測)。
                     if (IsNestedClaude())
