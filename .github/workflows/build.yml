@@ -28,6 +28,10 @@ jobs:
             exit 1
           }
 
+      - name: Test ninja and state invariants
+        shell: pwsh
+        run: ./test.ps1
+
       - name: Verify binaries
         shell: pwsh
         run: |

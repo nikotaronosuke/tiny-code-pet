@@ -1,7 +1,7 @@
 // Tiny Code Pet - 常駐デスクトップペット本体 (binary 名は ClaudePet.exe)
 // 公開上の製品名は Tiny Code Pet。exe 名 / class 名 / namespace / WndClassName /
 // mutex 名は既存 hooks と install script との互換のため ClaudePet* のまま。
-// 純Win32 (P/Invoke) + layered window。アイドル時は GetMessage でブロックし CPU 0%。
+// 純Win32 (P/Invoke) + layered window。忍者の表示中のみ低FPSでスプライト再生。
 // 描画は System.Drawing で ARGB ビットマップを合成し UpdateLayeredWindow で反映。
 // タイマーはアニメーション中のみ SetTimer し、終了後は必ず KillTimer する。
 //
@@ -30,7 +30,7 @@
 // quiet window の長さと deadline 管理だけ共通化し、state 遷移・turn 分離は
 // provider ごとに分けたまま (Codex の old-turn 遅延イベントを混ぜない)。
 //
-// 表示は常にペット1匹。優先度 active (Working/Waiting/Finalizing) >
+// 表示はメイン忍者1匹と、表示セッションで観測したサブエージェントの分身。優先度 active (Working/Waiting/Finalizing) >
 // 完了通知 (Celebrating)、同率は最新イベントの session。完了通知を出すのは
 // 満了時に他の active が無いときだけで、過去の完了で進行中の作業を隠さない。
 //
@@ -38,7 +38,7 @@
 // 作成時の一度きりでは不十分だった。実運用で背面へ回る現象を確認しており、
 // 何らかの理由で TOPMOST を失った場合に再保証する経路が無かった (失った
 // 具体的な契機は特定できていない)。表示内容が変わった時と明示操作の時だけ
-// HWND_TOPMOST + SWP_NOACTIVATE で再保証する (polling も常時 timer も無し)。
+// HWND_TOPMOST + SWP_NOACTIVATE で再保証する (状態監視pollingなし、アニメtickでは再保証しない)。
 // focus は決して奪わない (WS_EX_NOACTIVATE / click-through 維持)。
 //
 // 通知領域 (system tray) に管理アイコンを 1 つ持つ (Shell_NotifyIcon)。
@@ -304,6 +304,8 @@ namespace ClaudePet
         public const int TaskSnapshot = 8;      // TodoWrite スナップショット (extra="c/i/t")
         public const int TaskRemoved = 9;       // Task削除/キャンセル (extra=task_id)
         public const int TaskInProgress = 10;   // Task着手 (extra=task_id)
+        public const int SubagentStart = 12;
+        public const int SubagentStop = 13;
         public const int SessionMetadata = 11;  // SessionStart (extra=model identifier)
                                                 // 表示用 metadata だけ。進捗・完了判定には影響させない
 
@@ -338,6 +340,7 @@ namespace ClaudePet
         public const int MetadataOnly = 7;      // SessionStart だけ受けた休眠状態。
                                                 // 表示しないし active にも数えない
 
+        public readonly SubagentRoster Subagents = new SubagentRoster();
         public string Project;
         public int State;
         public long LastSeq;        // 単調増加のイベント順序
@@ -383,6 +386,7 @@ namespace ClaudePet
         public void ResetRequest()
         {
             RequestGen++;
+            Subagents.Reset();
             SnapTotal = -1;
             SnapDone = 0;
             SnapInProg = 0;
@@ -438,12 +442,18 @@ namespace ClaudePet
     {
         private const string WndClassName = "ClaudeDesktopPetWnd";
 
-        private static readonly IntPtr TimerBounce = new IntPtr(1);
         private static readonly IntPtr TimerRevert = new IntPtr(2);
         private static readonly IntPtr TimerQuiet = new IntPtr(4); // root Stop 後の quiet window 用 one-shot
 
-        private const int BounceIntervalMs = 30;
-        private const int RevertDelayMs = 3700;        // 完了バウンド後のメッセージ表示継続時間
+        private static readonly IntPtr TimerSprite = new IntPtr(5);
+        private readonly SpriteAnimator _sprite = new SpriteAnimator();
+        private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+        private Bitmap _hud;
+        private int _cloneCount;
+        private int _oldCloneCount;
+        private long _clonesChanged;
+        private int _spriteInterval;
+        private const int RevertDelayMs = 5000;        // 完了ポーズを含む通知全体の表示時間
         // completion = root Stop + この静穏時間。provider 共通の唯一の完了条件。
         // Stop は「終わった宣言」ではなく candidate で、継続イベントが来たら取消す。
         // Claude 2 秒 / Codex 5 秒だった旧 grace は、意味が同じになったのでこれに統一した。
@@ -452,14 +462,12 @@ namespace ClaudePet
         private const int MaxSessions = 8;             // 通常同時利用は数セッション。無制限に増やさない
         private static readonly TimeSpan StaleAfter = TimeSpan.FromHours(4);
 
-        private const int AnimNone = 0;
-        private const int AnimCelebrate = 1;  // 3回大きくバウンド
 
         // ---- 通知領域 (tray) ----
         private const int WmTrayIcon = 0x8001;    // WM_APP + 1: tray callback
         private const uint TrayIconId = 1;
-        private const int CmdShowPet = 1001;      // tray menu: ヒヨコを表示
-        private const int CmdHidePet = 1002;      // tray menu: ヒヨコを隠す
+        private const int CmdShowPet = 1001;      // tray menu: 忍者を表示
+        private const int CmdHidePet = 1002;      // tray menu: 忍者を隠す
         private const int CmdBringToFront = 1003; // tray menu: 最前面に戻す
         private const int CmdExitPet = 1004;      // tray menu: ClaudePetを終了
 
@@ -472,10 +480,8 @@ namespace ClaudePet
         private int _baseX;
         private int _baseY;
 
-        private int _animMode = AnimNone;
-        private int _bounceFrame;
 
-        // 明示 hide (tray の「ヒヨコを隠す」)。visual だけの hide で、hooks 受信・
+        // 明示 hide (tray の「忍者を隠す」)。visual だけの hide で、hooks 受信・
         // 進捗・完了判定・session 管理は全て継続する。hidden 中は描画と完了音を止める。
         private bool _petVisible = true;
         private bool _trayAdded;
@@ -512,10 +518,8 @@ namespace ClaudePet
             _scale = dpi / 96f;
 
             _winW = S(280); // ピル内テキストの幅で決まる (文字サイズを変えないので不変)
-            // 上余白10 + 最大ピル109 (ヘッダ+meta+bar+%+project) + 間隔10 + キャラ〜ラベル74。
-            // activity indicator 行の廃止で 1 行分縮んだ (221 -> 204)。
-            // キャラは下端基準なので画面上の位置は変わらない。
-            _winH = S(204);
+            // HUD、96pxメイン忍者、40px分身の専用行を確保する。
+            _winH = S(280);
 
             Native.RECT work = new Native.RECT();
             Native.SystemParametersInfo(0x0030 /*SPI_GETWORKAREA*/, 0, ref work, 0);
@@ -585,9 +589,9 @@ namespace ClaudePet
                     return new IntPtr(1);
 
                 case Native.WM_TIMER:
-                    if (wParam == TimerBounce) OnBounceTick();
-                    else if (wParam == TimerRevert) OnRevert();
+                    if (wParam == TimerRevert) OnRevert();
                     else if (wParam == TimerQuiet) OnQuietTick();
+                    else if (wParam == TimerSprite) OnSpriteTick();
                     return IntPtr.Zero;
 
                 case WmTrayIcon:
@@ -605,9 +609,11 @@ namespace ClaudePet
 
                 case Native.WM_DESTROY:
                     RemoveTrayIcon(); // menu 経由でも WM_CLOSE 経由でも tray を残さない
-                    Native.KillTimer(_hwnd, TimerBounce);
                     Native.KillTimer(_hwnd, TimerRevert);
                     Native.KillTimer(_hwnd, TimerQuiet);
+                    Native.KillTimer(_hwnd, TimerSprite);
+                    if (_hud != null) _hud.Dispose();
+                    _sprite.Dispose();
                     Native.PostQuitMessage(0);
                     return IntPtr.Zero;
             }
@@ -646,7 +652,7 @@ namespace ClaudePet
 
                 if (isCodex) OnCodexEvent(eventType, sessionId, project, extra, turnId);
                 else OnEvent(eventType, sessionId, project, extra);
-                PetDebug("recv ev=" + eventType + " sess=" + sessionId + " -> shown=" + _shownKey);
+                PetDebug("recv ev=" + eventType + " session=present");
             }
             catch (Exception ex) { PetDebug("recv-error " + ex.GetType().Name + " " + ex.Message); }
         }
@@ -712,6 +718,15 @@ namespace ClaudePet
                     ApplyTaskEvent(s, eventType, extra);
                     break;
 
+                case PetEvent.SubagentStart:
+                case PetEvent.SubagentStop:
+                    // Never create a root session or complete it from a child event.
+                    if (s == null || !IsActive(s.State)) return;
+                    s.Subagents.Apply(eventType == PetEvent.SubagentStart, extra);
+                    s.State = Session.Working;
+                    s.QuietDueUtc = DateTime.MinValue;
+                    break;
+
                 case PetEvent.SessionMetadata:
                     // SessionStart。model だけを覚える。UserPromptSubmit より先に来るので
                     // これだけでは「作業中…」を出さないし active にも数えない。
@@ -737,7 +752,7 @@ namespace ClaudePet
                     _recentlyEnded.Remove(sessionId); // 正当な再開
                     s = Upsert(sessionId, s, project, true);
                     // 完全 auto 運用: 確認 UI は出さない。state は互換のため Waiting のまま
-                    // 残すが、描画は「作業中…」と同じ。音もバウンドも無し。
+                    // 残すが、描画は「作業中…」と同じ。音も完了ポーズも無し。
                     // permission 待ち = 作業継続なので completion candidate は取消す。
                     s.State = Session.Waiting;
                     s.QuietDueUtc = DateTime.MinValue;
@@ -757,6 +772,7 @@ namespace ClaudePet
                     break;
 
                 case PetEvent.SessionEnd:
+                    if (s != null) s.Subagents.Reset();
                     // SessionEnd 単体は完了の根拠にしない。Celebrating 中は即削除しない
                     // (claude -p 終了時の SessionEnd が完了通知を打ち消してしまうため)。
                     // Finalizing 中も残して quiet window を継続させる
@@ -782,7 +798,7 @@ namespace ClaudePet
         }
 
         // イベント処理後の共通後処理 (prune / 再描画)。
-        // 音とバウンドは完了時だけで、それを出せるのは FinalizeDue のみ。
+        // 音と完了ポーズは完了時だけで、それを出せるのは FinalizeDue のみ。
         // 確認要求・警告の音/アニメは完全 auto 運用のため廃止した。
         private void AfterEvent()
         {
@@ -853,7 +869,7 @@ namespace ClaudePet
                     s = Upsert(key, s, project, true);
                     s.IsCodex = true;
                     if (s.TurnId.Length == 0) s.TurnId = turnId;
-                    // 確認 UI は出さない (作業中…と同じ描画。音・バウンド無し)。
+                    // 確認 UI は出さない (作業中…と同じ描画。音・完了ポーズ無し)。
                     // candidate 取消のため state だけ Waiting を維持する。
                     s.State = Session.Waiting;
                     s.QuietDueUtc = DateTime.MinValue;
@@ -883,6 +899,7 @@ namespace ClaudePet
                     if (!TurnMatches(s, turnId)) return;
                     if (IsTerminal(s.State)) { Touch(s, project); break; }
                     s.TurnHasSubagent = true;
+                    s.Subagents.Apply(eventType == PetEvent.CodexSubagentStart, extra);
                     s.SnapTotal = -1; s.SnapDone = 0; s.SnapInProg = 0; // 表示済み progress も無効化
                     // subagent の出入りも work continuation。candidate を取消す
                     if (s.State == Session.Finalizing) s.State = Session.Working;
@@ -890,6 +907,8 @@ namespace ClaudePet
                     break;
 
                 case PetEvent.CodexSessionEnd:
+                    if (s != null && turnId.Length > 0 && !TurnMatches(s, turnId)) return;
+                    if (s != null) s.Subagents.Reset();
                     // Celebrating / Finalizing 中は消さない (通知そのものが消えるため)。
                     // 削除により permission (Waiting) 状態も解除される。
                     if (s != null && s.State != Session.Celebrating && s.State != Session.Finalizing)
@@ -1160,7 +1179,7 @@ namespace ClaudePet
             // 届いた場合も再描画させるため、key に含める。
             string key = (s == null) ? "idle"
                 : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + pct
-                  + "|" + meta + "|" + others;
+                  + "|" + meta + "|" + others + "|" + s.Subagents.Count;
             if (!force && key == _shownKey) return; // 同一表示なら再描画しない (PostToolUse連発対策)
             _shownKey = key;
 
@@ -1172,51 +1191,97 @@ namespace ClaudePet
                 bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project, meta, others);
             else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct, meta, others);
 
-            using (bmp) { ApplyBitmap(bmp, _baseX, _baseY); }
+            if (_hud != null) _hud.Dispose();
+            _hud = bmp;
+            long now = _clock.ElapsedMilliseconds;
+            _sprite.Select(s == null ? 0 : s.State == Session.Celebrating ? 2 : 1, now);
+            int count = s == null || !IsActive(s.State) ? 0 : s.Subagents.Count;
+            if (_cloneCount != count)
+            {
+                _oldCloneCount = _cloneCount;
+                _cloneCount = count;
+                _clonesChanged = now;
+            }
+            // Root/session cleanup clears clones immediately; only child lifecycle
+            // events within active work animate their arrival/departure.
+            if (s == null || !IsActive(s.State)) _oldCloneCount = 0;
+            DrawSpriteFrame();
+            ArmSpriteTimer();
 
-            if (_animMode == AnimNone) MoveTo(_baseX, _baseY);
             // 表示内容が実際に変わった時だけ TOPMOST を再保証する (event-driven のみ)
             EnsureTopmost();
         }
 
-        // ---- アニメーション ------------------------------------------------
-
-        private void StartBounce(int mode)
+        private void ArmSpriteTimer()
         {
-            Native.KillTimer(_hwnd, TimerBounce);
-            // 直前の完了通知の revert が残っていると、新しい通知が数百 ms で
-            // 消えてしまう。表示時間は通知ごとに数え直す。
-            Native.KillTimer(_hwnd, TimerRevert);
-            _animMode = mode;
-            _bounceFrame = 0;
-            Native.SetTimer(_hwnd, TimerBounce, BounceIntervalMs, IntPtr.Zero);
+            long now = _clock.ElapsedMilliseconds;
+            bool transition = now - _clonesChanged < 500 && _oldCloneCount != _cloneCount;
+            int interval = !_petVisible || (!_sprite.NeedsTick(now) && !transition) ? 0 :
+                transition ? 50 : _sprite.NextTickMs(now);
+            if (interval == _spriteInterval) return;
+            Native.KillTimer(_hwnd, TimerSprite);
+            _spriteInterval = interval;
+            if (interval > 0) Native.SetTimer(_hwnd, TimerSprite, (uint)interval, IntPtr.Zero);
         }
 
-        private void OnBounceTick()
+        private void OnSpriteTick()
         {
-            // アニメは完了の 3 回バウンドだけ (警告系の軽バウンドは廃止)
-            const int totalFrames = 44; // 約1.3秒
-            const int bounces = 3;
-            int amplitude = S(11); // キャラ半分に合わせた跳ね幅
+            if (!_petVisible) { ArmSpriteTimer(); return; }
+            DrawSpriteFrame();
+            ArmSpriteTimer();
+        }
 
-            _bounceFrame++;
-            if (_bounceFrame >= totalFrames)
+        private void DrawSpriteFrame()
+        {
+            if (_hud == null || !_petVisible) return;
+            using (Bitmap frame = ComposeSpriteFrame()) ApplyBitmap(frame,_baseX,_baseY);
+        }
+
+        private Bitmap ComposeSpriteFrame()
+        {
+            return ComposeSpriteFrameAt(_clock.ElapsedMilliseconds);
+        }
+
+        private Bitmap ComposeSpriteFrameAt(long now)
+        {
+            Bitmap frame = (Bitmap)_hud.Clone();
+            try
             {
-                Native.KillTimer(_hwnd, TimerBounce);
-                MoveTo(_baseX, _baseY);
-                bool wasCelebrate = (_animMode == AnimCelebrate);
-                _animMode = AnimNone;
-                if (wasCelebrate)
+                using (Graphics g = Graphics.FromImage(frame))
                 {
-                    // メッセージをしばらく表示してから静止状態へ戻す
-                    Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
+                    _sprite.Draw(g, new Rectangle((_winW-S(96))/2, _winH-S(152), S(96), S(96)), now, 0);
+                    float progress = Math.Max(0f, Math.Min(1f, (now-_clonesChanged)/500f));
+                    int visible = Math.Min(6, Math.Max(_cloneCount, progress < 1 ? _oldCloneCount : 0));
+                    for (int i=0; i<visible; i++)
+                    {
+                        bool arriving = i >= Math.Min(6,_oldCloneCount) && i < _cloneCount;
+                        bool leaving = i >= Math.Min(6,_cloneCount);
+                        float amount = arriving ? progress : leaving ? 1-progress : 1;
+                        int size = Math.Max(1, S(40)* (int)(amount*100)/100);
+                        int x = S(10+i*36) + (S(40)-size)/2;
+                        int y = _winH-S(50) + S(40)-size;
+                        _sprite.Draw(g, new Rectangle(x,y,size,size), now, i+1);
+                        if ((arriving || leaving) && progress < 1)
+                        {
+                            using (var smoke = new SolidBrush(Color.FromArgb((int)(110*(1-progress)), 150,160,175)))
+                            {
+                                g.FillEllipse(smoke,x-S(4),y+size-S(18),size,S(18));
+                                g.FillEllipse(smoke,x+S(6),y+size-S(26),S(23),S(22));
+                            }
+                        }
+                    }
+                    if (_cloneCount > 6)
+                        using (var font = new Font("Yu Gothic UI", 11*_scale, FontStyle.Bold, GraphicsUnit.Pixel))
+                        using (var brush = new SolidBrush(Color.Teal))
+                            g.DrawString("+"+(_cloneCount-6),font,brush,_winW-S(42),_winH-S(35));
                 }
-                return;
+                // Frame ticks never reassert TOPMOST or rebuild the text HUD.
+                return frame;
             }
-            double t = (double)_bounceFrame / totalFrames;
-            int offset = (int)(amplitude * Math.Abs(Math.Sin(t * Math.PI * bounces)));
-            MoveTo(_baseX, _baseY - offset);
+            catch { frame.Dispose(); throw; }
         }
+
+        // ---- アニメーション ------------------------------------------------
 
         // quiet window 満了: 期限の来た session だけ確定し、残りがあれば
         // 最短期限へ timer を張り直す (one-shot のまま)。
@@ -1275,6 +1340,7 @@ namespace ClaudePet
                     continue;
                 }
                 s.State = Session.Celebrating;
+                s.Subagents.Reset();
                 _seq++;
                 s.LastSeq = _seq;
                 s.LastAtUtc = DateTime.UtcNow;
@@ -1282,14 +1348,14 @@ namespace ClaudePet
                 PetDebug("finalize sess=" + key + " -> state=" + s.State);
             }
 
-            // 音とバウンドは実際に完了通知を出すときだけ。明示 hide 中は
+            // 音と完了ポーズは実際に完了通知を出すときだけ。明示 hide 中は
             // ユーザーが意図的に Pet を消しているので音も鳴らさない (後で再生もしない)。
             if (celebrated && _petVisible) Native.MessageBeep(Native.SOUND_DEFAULT);
             RenderCurrent(false);
             PetDebug("finalize-render shown=" + _shownKey);
             if (celebrated)
             {
-                if (_petVisible) StartBounce(AnimCelebrate);
+                if (_petVisible) Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
                 else
                 {
                     // hidden 中でも Celebrating エントリは通常と同じ寿命で片付ける
@@ -1323,14 +1389,6 @@ namespace ClaudePet
 
             RenderCurrent(false); // 残っている作業中セッションか Idle の表示へ戻る
             TrimMemory();
-        }
-
-        // 位置だけを動かす (bounce の 30ms tick 用)。Z-order はここでは触らない
-        // (TOPMOST の再保証は EnsureTopmost に分離。毎 tick assert しない)。
-        private void MoveTo(int x, int y)
-        {
-            Native.SetWindowPos(_hwnd, IntPtr.Zero, x, y, 0, 0,
-                Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_NOZORDER);
         }
 
         // ---- Z-order / 表示制御 --------------------------------------------
@@ -1369,14 +1427,7 @@ namespace ClaudePet
         {
             if (!_petVisible) return;
             _petVisible = false;
-            if (_animMode != AnimNone)
-            {
-                // bounce 途中なら打ち切る。Celebrating の掃除 (OnRevert) は
-                // 本来 bounce 完了後に schedule されるので、ここで代わりに張る。
-                Native.KillTimer(_hwnd, TimerBounce);
-                _animMode = AnimNone;
-                Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
-            }
+            ArmSpriteTimer();
             Native.ShowWindow(_hwnd, Native.SW_HIDE);
             PetDebug("hide-pet");
         }
@@ -1395,8 +1446,11 @@ namespace ClaudePet
         {
             try
             {
-                using (Bitmap bmp = PetRenderer.RenderTrayBitmap(32))
+                using (Bitmap bmp = new Bitmap(32,32))
+                {
+                    using(Graphics g = Graphics.FromImage(bmp)) _sprite.Draw(g,new Rectangle(0,0,32,32),0,0);
                     _trayIconHandle = bmp.GetHicon();
+                }
                 var nid = new Native.NOTIFYICONDATA();
                 nid.cbSize = Marshal.SizeOf(typeof(Native.NOTIFYICONDATA));
                 nid.hWnd = _hwnd;
@@ -1456,9 +1510,9 @@ namespace ClaudePet
             try
             {
                 Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? Native.MF_GRAYED : 0),
-                    (uint)CmdShowPet, "ヒヨコを表示");
+                    (uint)CmdShowPet, "忍者を表示");
                 Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? 0 : Native.MF_GRAYED),
-                    (uint)CmdHidePet, "ヒヨコを隠す");
+                    (uint)CmdHidePet, "忍者を隠す");
                 Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdBringToFront, "最前面に戻す");
                 Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
                 Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "Tiny Code Petを終了");
@@ -1530,20 +1584,15 @@ namespace ClaudePet
         }
     }
 
-    // キャラクター描画。画像差し替えは このクラスの実装を置き換えるだけでよい。
+    // 状態HUDの描画。キャラクターは SpriteAnimator で別途合成する。
     internal static class PetRenderer
     {
-        private static readonly Color BodyColor = Color.FromArgb(255, 214, 68);
-        private static readonly Color BodyEdge = Color.FromArgb(216, 172, 40);
-        private static readonly Color BeakColor = Color.FromArgb(240, 144, 50);
-        private static readonly Color CheekColor = Color.FromArgb(90, 255, 150, 120);
 
         public static Bitmap RenderIdle(int w, int h, float scale)
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
             {
-                DrawChick(g, w, h, scale);
                 DrawLabel(g, w, h, scale, "Tiny Code Pet");
             }
             return bmp;
@@ -1560,7 +1609,6 @@ namespace ClaudePet
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
             {
-                DrawChick(g, w, h, scale);
                 DrawStatusPill(g, w, h, scale, "作業中…", TitleNeutral, project, pct, meta, otherActive);
             }
             return bmp;
@@ -1591,7 +1639,7 @@ namespace ClaudePet
             float bw = w - 48 * scale;
             float bh = (cursor + 7f) * scale;
             // しっぽ無しなのでキャラのすぐ上へ。中身が増減しても頭との距離は一定。
-            float by = ChickTopY(h, scale) - 10 * scale - bh;
+            float by = NinjaTopY(h, scale) - 10 * scale - bh;
             if (by < 10 * scale) by = 10 * scale; // 上端はみ出し防止 (念のため)
 
             using (GraphicsPath path = RoundedRect(bx, by, bw, bh, 12 * scale))
@@ -1650,7 +1698,6 @@ namespace ClaudePet
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
             {
-                DrawChick(g, w, h, scale);
                 DrawPill(g, w, h, scale, "終わったよ！", project,
                     Color.FromArgb(238, 255, 255, 255),   // 背景: 白
                     Color.FromArgb(255, 205, 198, 188),   // 枠: グレー
@@ -1765,111 +1812,7 @@ namespace ClaudePet
             return g;
         }
 
-        // 通知領域アイコン用の小さなひよこ。既存 DrawChick と同じ配色を
-        // そのまま使い、外部画像ファイルは増やさない。呼び出し側が
-        // Bitmap.GetHicon() で HICON 化し、DestroyIcon で解放する。
-        public static Bitmap RenderTrayBitmap(int size)
-        {
-            Bitmap bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-            using (Graphics g = NewGraphics(bmp))
-            {
-                float cx = size / 2f;
-                float cy = size / 2f;
-                float r = size * 0.42f;
-
-                using (var body = new SolidBrush(BodyColor))
-                    g.FillEllipse(body, cx - r, cy - r, r * 2, r * 2);
-                using (var edge = new Pen(BodyEdge, Math.Max(1f, size * 0.05f)))
-                    g.DrawEllipse(edge, cx - r, cy - r, r * 2, r * 2);
-
-                using (var eye = new SolidBrush(Color.FromArgb(40, 34, 28)))
-                {
-                    float er = size * 0.075f;
-                    g.FillEllipse(eye, cx - r * 0.42f - er, cy - r * 0.28f - er, er * 2, er * 2);
-                    g.FillEllipse(eye, cx + r * 0.42f - er, cy - r * 0.28f - er, er * 2, er * 2);
-                }
-
-                using (var beak = new SolidBrush(BeakColor))
-                {
-                    PointF[] tri = new PointF[]
-                    {
-                        new PointF(cx - size * 0.09f, cy + r * 0.02f),
-                        new PointF(cx + size * 0.09f, cy + r * 0.02f),
-                        new PointF(cx, cy + r * 0.4f)
-                    };
-                    g.FillPolygon(beak, tri);
-                }
-            }
-            return bmp;
-        }
-
-        // キャラ本体だけの倍率。文字サイズ (ピル・ラベル) には掛けない。
-        private const float ChickScale = 0.5f;
-
-        // キャラ頭頂の y (window 座標)。ピル類はこれを基準に下端を合わせるので、
-        // 中身の量で高さが変わってもキャラとの距離は一定に保たれる。
-        private static float ChickTopY(int h, float scale)
-        {
-            return h - 56 * scale - 36 * scale * ChickScale;
-        }
-
-        private static void DrawChick(Graphics g, int w, int h, float scale)
-        {
-            // s = キャラ内部の寸法用 (線幅・パーツも比例縮小)。
-            // 配置は window 単位 (scale) のままなので、足元は従来と同じ画面位置に残る。
-            float s = scale * ChickScale;
-            float cx = w / 2f;
-            float cy = h - 56 * scale;
-            float r = 36 * s;
-
-            // 足
-            using (var pen = new Pen(BeakColor, 2.5f * s))
-            {
-                g.DrawLine(pen, cx - 12 * s, cy + r - 4 * s, cx - 14 * s, cy + r + 8 * s);
-                g.DrawLine(pen, cx + 12 * s, cy + r - 4 * s, cx + 14 * s, cy + r + 8 * s);
-            }
-
-            // 体
-            using (var body = new SolidBrush(BodyColor))
-                g.FillEllipse(body, cx - r, cy - r, r * 2, r * 2);
-            using (var edge = new Pen(BodyEdge, 2f * s))
-                g.DrawEllipse(edge, cx - r, cy - r, r * 2, r * 2);
-
-            // 羽
-            using (var wing = new Pen(BodyEdge, 2f * s))
-            {
-                g.DrawArc(wing, cx - r + 4 * s, cy - 6 * s, 18 * s, 20 * s, 60, 180);
-                g.DrawArc(wing, cx + r - 22 * s, cy - 6 * s, 18 * s, 20 * s, -60, 180);
-            }
-
-            // 目
-            using (var eye = new SolidBrush(Color.FromArgb(40, 34, 28)))
-            {
-                float er = 4f * s;
-                g.FillEllipse(eye, cx - 14 * s - er, cy - 10 * s - er, er * 2, er * 2);
-                g.FillEllipse(eye, cx + 14 * s - er, cy - 10 * s - er, er * 2, er * 2);
-            }
-
-            // ほっぺ
-            using (var cheek = new SolidBrush(CheekColor))
-            {
-                float chr = 5.5f * s;
-                g.FillEllipse(cheek, cx - 24 * s - chr, cy + 2 * s - chr, chr * 2, chr * 2);
-                g.FillEllipse(cheek, cx + 24 * s - chr, cy + 2 * s - chr, chr * 2, chr * 2);
-            }
-
-            // くちばし
-            using (var beak = new SolidBrush(BeakColor))
-            {
-                PointF[] tri = new PointF[]
-                {
-                    new PointF(cx - 6 * s, cy - 2 * s),
-                    new PointF(cx + 6 * s, cy - 2 * s),
-                    new PointF(cx, cy + 8 * s)
-                };
-                g.FillPolygon(beak, tri);
-            }
-        }
+        private static float NinjaTopY(int h, float scale) { return h - 152 * scale; }
 
         private static void DrawLabel(Graphics g, int w, int h, float scale, string text)
         {
@@ -1896,7 +1839,7 @@ namespace ClaudePet
             float rad = 12 * scale;
             // しっぽの先がキャラの頭上に来るよう下端基準で配置する。
             float tailH = tail ? 10 * scale : 0f;
-            float by = ChickTopY(h, scale) - 19 * scale - tailH - bh;
+            float by = NinjaTopY(h, scale) - 19 * scale - tailH - bh;
             if (by < 10 * scale) by = 10 * scale; // 上端はみ出し防止 (念のため)
 
             using (GraphicsPath path = RoundedRect(bx, by, bw, bh, rad))

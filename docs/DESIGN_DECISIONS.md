@@ -848,3 +848,46 @@ adapter は plan の status 個数を数えるだけで、step 文字列を抽�
 - Codex は hooks.json に trust 承認 (trusted_hash) を要求する。
   **`--dangerously-bypass-hook-trust` を production 設定に入れない。**
   承認は人間が Codex 上で行う。
+
+
+## 2026-09-10: 忍者とサブエージェント分身
+
+ユーザーの明示依頼により、旧版の静止ヒヨコ・分身UIなしという方針を変更。
+状態機械は維持し、SpriteAnimatorとSubagentRosterを分離した。
+既存PetRendererはテキストHUDを担当し、生成した透過PNGを合成する。
+Win32 / C# 5を維持し、.NET Framework同梱System.Web.Extensionsで小さな
+アニメーション定義JSONだけを読む。新規パッケージは導入しない。
+
+分身は各セッション内の一意identityを追跡する。start重複を無視し、stop先着を
+tombstoneで記憶して遅延startの復活を防ぐ。active/stop集合は各256件まで。
+上限以降は新規分身を表示しない安全側の扱い。表示は6体まで。
+サブエージェントの状態はイベント観測の範囲であり、実プロセスの生存証明ではない。
+Stopがサブエージェント自身の応答終了を示す場合、別Hookによる継続・再開まで
+Petが把握できるとは限らない。新規startを伴わない同一IDの再開は表示しない。
+Claudeにはturn_idがないため、新しい依頼をまたぐ遅延startを厳密に分離できない。
+Codexは既存のturn照合を維持し、旧turn SessionEndで現在の分身を消さない。
+親の終了・完了・新規依頼で分身をクリアする。子の終了は親の完了根拠にしない。
+
+Claudeのevent 12/13を追加し、Codexの26/27はextraのみ拡張する。
+両adapterはトップレベルagent_idのみを選びSHA-256化し、Petへ送る。
+IDがなければ分身を作らない。本文、transcript、追加APIは使わない。
+
+公式仕様を確認した出典:
+- https://code.claude.com/docs/en/hooks#subagentstart
+- https://code.claude.com/docs/en/hooks#subagentstop
+- https://learn.chatgpt.com/docs/hooks#subagentstart
+
+実発火テストは未実施。合成metadataを使用したローカル回帰テストを実施し、
+正規イベントの取り扱いと描画を確認した。旧版のメモリ実測値は新版に適用しない。
+常駐設定の変更・新しいHookのインストールは別途ユーザー承認後に行う。
+
+### 常駐版の受信確認
+
+忍者版の実ウィンドウに対し、Claude/Codex形式の開始・分身6体の出入り・
+セッション終了を合成入力し、28件のWM_COPYDATA応答を確認した。
+これは実アプリのIPC確認であり、Claude/Codex自身によるHook発火の検証とは区別する。
+Codexの非管理Hookはユーザーの信頼操作が必要。信頼状態をツール側で偽装しない。
+
+現行の公式仕様ではHookは既定で有効となっているため、install-codex-hook.ps1は
+明示的な `hooks = true` がないことだけを理由に「無効」と断定しない。
+config.tomlを変更しない方針は維持する。

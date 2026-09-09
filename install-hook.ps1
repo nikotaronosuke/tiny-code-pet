@@ -48,6 +48,8 @@ $events = [ordered]@{
     "PostToolUse"      = "*"
     "SessionStart"     = $null
     "SessionEnd"       = $null
+    "SubagentStart"    = "*"
+    "SubagentStop"     = "*"
     "TaskCreated"      = $null
     "TaskCompleted"    = $null
 }

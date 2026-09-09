@@ -1,4 +1,4 @@
-# Tiny Code Pet 🐣
+# Tiny Code Pet 🥷
 
 [![Build](https://github.com/nikotaronosuke/tiny-code-pet/actions/workflows/build.yml/badge.svg)](https://github.com/nikotaronosuke/tiny-code-pet/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -7,10 +7,10 @@
 > A tiny native Windows desktop pet for Claude Code and Codex.
 
 Claude Code / Codex の作業状況・依頼全体の推定進捗・作業終了を、
-画面右下の小さなひよこで確認できる **超軽量 Windows デスクトップ Pet** です。
+画面右下の小さな忍者で確認できる **Windows ネイティブのデスクトップ Pet** です。
 Claude Code と Codex を同時に使っても session / 状態は衝突しません。
 
-![Tiny Code Pet preview](docs/assets/tiny-code-pet-preview.png)
+![Tiny Code Pet preview](docs/assets/ninja-working.gif)
 
 **一目でわかる特徴**
 
@@ -19,11 +19,11 @@ Claude Code と Codex を同時に使っても session / 状態は衝突しま�
 | 🤖 **Claude Code + Codex 対応** | 1 匹の Pet が両方を監視。どちらか片方だけでも使える |
 | 🪟 **Windows native** | 純 Win32 (C# P/Invoke)。Electron / WebView / Node 常駐なし |
 | 🚫 **邪魔をしない** | クリック透過・タスクバー/Alt+Tab 非表示・focus を奪わない |
-| 🐥 **tray から操作** | 表示 / 隠す / 最前面に戻す / 終了 |
+| 🥷 **tray から操作** | 表示 / 隠す / 最前面に戻す / 終了 |
 | 📊 **依頼全体の推定進捗** | 「今のタスク」ではなく依頼全体の工程表から算出 |
 | ✅ **root Stop + 20 秒静穏で完了** | tracker の状態に依存しない誠実な完了判定 |
 | 🔒 **privacy** | prompt / 応答 / ソース本文を一切読まない |
-| 🪶 **idle CPU ほぼ 0** | イベント駆動のみ。polling なし |
+| 🥷 **忍者と影分身** | 待機・作業・完了のアニメーションと、サブエージェント最大6体の表示 |
 
 ## 表示
 
@@ -31,9 +31,9 @@ Claude Code と Codex を同時に使っても session / 状態は衝突しま�
 
 | 状態 | 表示 | 意味 |
 |---|---|---|
-| Idle | 🐣 + `Tiny Code Pet` | 何もしていない。完全静止 |
-| 作業中 | 🐣 + 「作業中…」(+ 「**全体 推定 N%**」) + project名 | 放置してよい。permission 待ちも、Stop 後の静穏待ちも、すべてこの表示 |
-| 完了 | 🐣 + 「終わったよ！」+ project名 | root Stop の後 20 秒間その作業が再開されなかった (3回ピョコピョコ・通知音1回・約5秒後に Idle) |
+| Idle | 🥷 + `Tiny Code Pet` | 何もしていない。呼吸・瞬きの低速ループ |
+| 作業中 | 🥷 + 「作業中…」(+ 「**全体 推定 N%**」) + project名 | 放置してよい。permission 待ちも、Stop 後の静穏待ちも、すべてこの表示 |
+| 完了 | 🥷 + 「終わったよ！」+ project名 | root Stop の後 20 秒間その作業が再開されなかった (決めポーズを1回再生・通知音1回・約5秒後に Idle) |
 
 **「未完了」表示は無い。** 完了と言い切れない停止は何も出さずに Idle へ戻る。
 
@@ -47,11 +47,11 @@ Working / Finalizing / Waiting の session だけを数える (0 なら非表示
 ## 主な特徴
 
 - Native Win32 (C# P/Invoke)。**Electron / WebView / Node 常駐 / localhost サーバー / DB 一切なし**
-- 完全 event-driven (Claude Code 公式 Hooks 連携)。polling なし。アイドル時は `GetMessage` でブロック
+- 状態監視は event-driven (Hooks 連携)。polling なし。表示中のみアニメーションtimerが動く
 - 背景完全透過・枠なし・タスクバー/Alt+Tab 非表示・常に最前面
   (通常ウィンドウより前。TOPMOST を失っても表示更新時に自動復帰)
 - **クリック透過**: キャラの背後にある VS Code や Chrome をそのまま操作できる
-- **通知領域 (system tray) の 🐥 アイコン**から 表示 / 隠す / 最前面に戻す / 終了 を操作
+- **通知領域 (system tray) の 🥷 アイコン**から 表示 / 隠す / 最前面に戻す / 終了 を操作
 - 依頼全体の推定進捗表示 (新 Task システム / TodoWrite の両対応)
 - 進捗と完了判定は完全に独立 (進捗 % は plan から、完了は Stop + 静穏から)
 - 複数セッションの同時追跡 (優先度付き表示)
@@ -59,19 +59,35 @@ Working / Finalizing / Waiting の session だけを数える (0 なら非表示
 - Subagent 完了の誤通知防止
 - **Codex 対応** (別 adapter / provider + session + turn で状態分離)
 
-## 軽さ (参考実測値)
+## 忍者アニメーションと分身
 
-開発環境 (Windows 11) での実測。環境により変動するため保証値ではありません。
+- メイン: 待機は約4秒静止して短く瞬き・ごく小さな呼吸。作業は200ms間隔で手元だけ動かす。
+  頭・足・マフラーは固定。完了は8フレームを1回再生する。
+- 分身は400ms間隔でメインよりゆっくり動く。
+- [待機プレビュー](docs/assets/ninja-idle.gif) / [作業中プレビュー](docs/assets/ninja-working.gif)
+- 分身: 表示中の親セッションの `SubagentStart` / `SubagentStop` に連動。
+  最大6体を小さく並べ、超過分は分身の横に `+N` で表示する。
+  HUDの `+N` は従来どおり別セッション数で、分身とは別の情報。
+- 同じPNGを共用し、分身の再生タイミングをずらす。出入りに短い煙の演出。
+- identityが取れない場合は人数を推測しない。重複・終了先着を抑制し、
+  新しい依頼・セッション終了・親の完了で分身をクリアする。
+- 非表示中はアニメーションtimerを停止。状態監視・完了判定は継続する。
+- 素材: `assets/ninja/ninja.png` (1024×384、128pxセル×8列×3行)。
+  `ninja.json` に各動作の行・フレーム数・速度・ループ指定を持つ。
+  PNG/JSONはexeに埋め込まれ、配布時に追加ファイルは不要。
 
-| 項目 | 実測 |
-|---|---|
-| 待機時 Private Working Set | 約 13.5 MB (起動直後) 〜 17 MB (多数の進捗描画後の定常値・増加停止確認済み) |
-| 待機時 CPU (60秒計測) | ほぼ 0 ms (イベント無し時は完全 0%) |
-| 待機時 GPU | 0 (GPU エンジンインスタンス自体が0個) |
-| 作業中表示中 | Idle と同じ (静止ビットマップ、タイマーなし)。イベント到着時だけ瞬間再描画 |
-| アニメーション1回の CPU 累計 | 約 15〜50 ms |
-| Hook helper 1回 | 約 60〜70 ms で起動〜終了 (async のため Claude Code を待たせない)。残留プロセスなし |
-| GDI / USER / ハンドル | 大量イベント後も一定 (リークなし) |
+## 軽さと検証
+
+旧ヒヨコ版の「待機CPUほぼ0 / RAM十数MB」は忍者版の測定値ではありません。
+忍者版は表示中に低FPSの再描画を行います。常駐版のCPU・メモリは実環境での計測が必要です。
+テキストHUDはイベント時だけ再生成し、各フレームではキャラクターを合成します。
+TOPMOSTの再保証は状態変更・明示操作時だけで、フレーム更新では行いません。
+
+`./test.ps1` で状態遷移、分身の重複・順序逆転、旧ターン除外、20秒静穏、
+透過、アニメーション、非表示timer停止、描画リソースを検証できます。
+ローカル検証では47項目通過、500フレーム後のGDIオブジェクト増加は0でした。
+100% / 125% / 200%スケールのオフスクリーン描画も確認しています。
+実際のClaude/Codexが分身Hookを発火するところまでの結合検証は未実施です。
 
 ## How it works
 
@@ -87,7 +103,7 @@ ClaudePetNotify.exe   … Hook Adapter。正規化イベントへ変換して即
         ▼
 ClaudePet.exe         … 常駐ペット。session_id 単位の状態機械 (依頼=Request 単位で進捗管理)
         ▼
-Win32 layered window  … UpdateLayeredWindow で ARGB 描画 (状態変化時のみ)
+Win32 layered window  … UpdateLayeredWindow で ARGB 描画 (表示中は低FPSでキャラクターを更新)
 ```
 
 Codex は別の adapter を通る (Claude 側の契約は一切変えていない):
@@ -107,7 +123,7 @@ ClaudePet.exe         … 同じ常駐ペット。provider + session + turn で�
 ```
 
 - 実装: C# (P/Invoke による純 Win32)。**.NET Framework 4.8 同梱の csc.exe でビルドするため追加インストール不要**
-- タイマーはアニメーション・quiet window・表示期限の one-shot のみ。常時タイマーなし
+- 状態監視はpollingなし。表示中のアニメーションtimerと、quiet window・表示期限のtimerを使用
 - 通知領域アイコンは `Shell_NotifyIcon` (純 Win32)。アイコン画像も実行時に
   System.Drawing で描く (外部画像ファイルなし)。taskbar ボタンや Alt+Tab には出ない
 - ペット未起動時は Stop / UserPromptSubmit / permission_prompt で自動起動 (高頻度な PostToolUse では起動しない)
@@ -208,19 +224,19 @@ VS Code で入力中に Pet の表示が切り替わっても入力先は変わ�
 **何らかの理由で TOPMOST を失った場合に、それを再保証する経路が無かった**。
 (失った具体的な契機までは特定できていない。) Pet は**表示内容が実際に
 変わったとき**に `HWND_TOPMOST + SWP_NOACTIVATE` で Z-order を再保証する
-(event-driven のみ。polling も常時タイマーも増やしていない)。
+(状態変更・明示操作時のみ。アニメーションtickでTOPMOSTを再保証しない)。
 
 他の TOPMOST アプリとは Windows 標準の前後関係になる。押しのけ続けるような
 争いはしないので、隠れた場合は tray の「最前面に戻す」で復帰させる。
 
-通知領域の 🐥 アイコン:
+通知領域の 🥷 アイコン:
 
 | 操作 | 動作 |
 |---|---|
 | 左クリック | 最前面へ復帰 (hidden なら再表示 + 最新 state 描画 + 最前面) |
-| 右クリック | menu: ヒヨコを表示 / ヒヨコを隠す / 最前面に戻す / Tiny Code Petを終了 |
+| 右クリック | menu: 忍者を表示 / 忍者を隠す / 最前面に戻す / Tiny Code Petを終了 |
 
-「ヒヨコを隠す」は **visual hide** であって監視停止ではない。hidden 中も
+「忍者を隠す」は **visual hide** であって監視停止ではない。hidden 中も
 hooks 受信・進捗更新・完了判定・session 管理はすべて継続し、再表示した
 瞬間にその時点の最新 state を描く (過去の通知は再生しない)。
 ユーザーが意図的に消しているため、**hidden 中は完了音も鳴らさない**。
@@ -285,7 +301,9 @@ pwsh -File install-codex-hook.ps1           # 実際に追記
    既存 hook は一切変更しない。イベント単位で冪等。実行前に自動バックアップ。
    `-ProjectPath <dir>` で project 単位 (`<dir>\.codex\hooks.json`) へも入れられる。
 2. **`config.toml` はこのスクリプトが書き換えない。**
-   `[features] hooks = true` が無ければ必要な 2 行を案内するので自分で追記する。
+   現行CodexではHookは既定で有効。明示的な `hooks = true` が無いだけでは無効と判断しない。
+   古いビルドで明示有効化が必要な場合に限り、設定を確認する。
+   [公式Hook設定](https://learn.chatgpt.com/docs/hooks#turn-hooks-off)を参照。
 3. Codex は次回起動時に hooks.json の内容確認 (trust) を求めるので承認する。
    `--dangerously-bypass-hook-trust` は使わない。
 4. hook は新しい Codex セッションから有効。
@@ -420,6 +438,7 @@ Claude 側と Codex 側は独立していて、片方だけ入れても動く。
 | `PostToolUse` | `*` | Waiting 解除・Task/Todo 進捗・completion candidate 取消 |
 | `SessionStart` | なし | model 表示用 metadata (これだけでは作業中にしない) |
 | `SessionEnd` | なし | セッション後片付け |
+| `SubagentStart` / `SubagentStop` | `*` | 分身の出入り (親の完了にはしない) |
 | `TaskCreated` | なし | Task 進捗 |
 | `TaskCompleted` | なし | Task 進捗 |
 
@@ -428,6 +447,15 @@ Claude 側と Codex 側は独立していて、片方だけ入れても動く。
 
 - ユーザーレベル設定なので全プロジェクトで有効
 - Hook は Claude Code セッション開始時に読み込まれるため、**設定後は新しいセッションから有効**
+
+### 忍者版への更新
+
+`build.ps1` は通常 `bin` に出力する。動作中の旧exeを上書きする前にそのPetを終了する。
+並行してビルドだけ試す場合は `./build.ps1 -OutputDirectory bin/ninja-preview` を使う。
+Claude側の分身には `install-hook.ps1` の再実行による2イベントの追加が必要。
+ユーザーレベル設定への変更なので、AIは承認なしに実行しない。
+Codex側は既存のSubagentStart/Stop登録を使用し、adapterを更新する。
+Hookが未発火・未登録の場合、メイン忍者は動くが分身は現れない。
 
 ### 操作
 
@@ -481,7 +509,7 @@ Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$e
 - permission 待ちは内部 state としてのみ扱い、確認 UI は表示しない
 - マルチモニタ: プライマリモニタの右下固定。モニタ構成変更後はペット再起動が必要
 - DPI はシステム DPI 基準 (セッション中の DPI 変更には追従しない)
-- キャラはコード描画のひよこ (`src/Pet.cs` の `PetRenderer` 差し替えで変更可能)
+- キャラ差し替えは `assets/ninja/ninja.png` / `ninja.json` を編集して再ビルドする
 - **Claude の model 表示は `SessionStart` 経由**なので、`/model` でセッション途中に
   切り替えると、次の startup / resume / clear / compact まで古いままになる。
   transcript 監視や polling を入れてまで追跡しない (model 不明時は provider だけ表示)
@@ -501,8 +529,8 @@ turn 数・実行時間・コストが大きく増えるためツール側では
 ## Development status
 
 Claude Code の状態を手元で確認したくて作った個人用の小さなツールです。
-その目的に必要な機能だけを最小構成で実装しており、現時点ではこれで完成としています。
-今後は、不具合修正や実際に使って必要になった変更があれば更新する程度の予定です。
+現在は明示依頼に基づき、忍者アニメーションとサブエージェント分身を追加しています。
+新しい状態判定・診断画面・Verified等は今回の対象外です。
 
 ## AI-assisted development
 

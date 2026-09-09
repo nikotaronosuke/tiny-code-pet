@@ -138,10 +138,12 @@ namespace CodexPetNotify
 
                     case "SubagentStart":
                         eventType = EvCodexSubagentStart;
+                        extra = AgentIdentity.Token(json);
                         break;
 
                     case "SubagentStop":
                         eventType = EvCodexSubagentStop;
+                        extra = AgentIdentity.Token(json);
                         break;
 
                     default:
@@ -155,7 +157,7 @@ namespace CodexPetNotify
                 if (dryRun)
                 {
                     WriteLine("ev=" + eventType + " sess=" + sessionId + " turn=" + turnId +
-                              " proj=" + project + " extra=" + extra);
+                              " proj=" + project + " extra=" + ((eventType == 26 || eventType == 27) ? (extra.Length > 0 ? "present" : "missing") : extra));
                     return 0;
                 }
 
@@ -202,7 +204,7 @@ namespace CodexPetNotify
                 byte[] line = Encoding.UTF8.GetBytes(
                     DateTime.Now.ToString("HH:mm:ss.fff") + " [codex] ev=" + eventType +
                     " sess=" + sessionId + " turn=" + turnId + " proj=" + project +
-                    " extra=" + extra + " " + note + "\r\n");
+                    " extra=" + ((eventType == 26 || eventType == 27) ? (extra.Length > 0 ? "present" : "missing") : extra) + " " + note + "\r\n");
                 using (var fs = new FileStream(Path.Combine(dir, "debug.log"),
                     FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
                 {

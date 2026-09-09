@@ -47,6 +47,8 @@ namespace ClaudePetNotify
         private const int EvTaskSnapshot = 8;   // PostToolUse(TodoWrite) から導出した "c/i/t"
         private const int EvTaskRemoved = 9;    // TaskUpdate(deleted/cancelled)。削除はhookが発火しない (実測)
         private const int EvTaskInProgress = 10; // TaskUpdate(in_progress) (extra=task_id)
+        private const int EvSubagentStart = 12;
+        private const int EvSubagentStop = 13;
         private const int EvSessionMetadata = 11; // SessionStart (extra=model identifier)
 
         // model identifier の長さ上限。payload は行区切りなので
@@ -242,6 +244,11 @@ namespace ClaudePetNotify
 
                     switch (eventName)
                     {
+                        case "SubagentStart":
+                        case "SubagentStop":
+                            eventType = eventName == "SubagentStart" ? EvSubagentStart : EvSubagentStop;
+                            extra = AgentIdentity.Token(json);
+                            break;
                         case "Stop":
                             if (agentId.Length > 0) return 0; // 内部subagentの完了は通知しない
                             eventType = EvTaskComplete;
@@ -338,7 +345,7 @@ namespace ClaudePetNotify
                 }
 
                 bool ok = SendEvent(hwnd, eventType, sessionId + "\n" + project + "\n" + extra);
-                DebugLog(eventType, sessionId, project + " extra=" + extra + " " + EnvSummary(),
+                DebugLog(eventType, sessionId, project + " extra=" + ((eventType == 12 || eventType == 13) ? (extra.Length > 0 ? "present" : "missing") : extra) + " " + EnvSummary(),
                     ok ? "sent" : "SEND-FAIL err=" + Marshal.GetLastWin32Error());
             }
             catch { }

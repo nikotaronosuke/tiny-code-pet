@@ -143,8 +143,9 @@ Write-Host ""
 if ($featureOk) {
     Write-Host "OK: [features] hooks = true is present in $configPath"
 } else {
-    Write-Host "ACTION REQUIRED: Codex hooks are not enabled yet."
-    Write-Host "  Add these two lines to $configPath (this script never edits it):"
+    Write-Host "NOTE: No explicit hooks=true setting was detected."
+    Write-Host "  Current Codex enables hooks by default; this is not proof they are disabled."
+    Write-Host "  If an older build requires explicit enablement, review these settings (not edited here):"
     Write-Host "    [features]"
     Write-Host "    hooks = true"
 }

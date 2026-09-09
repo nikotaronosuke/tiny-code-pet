@@ -6,7 +6,7 @@
 
 ## Project status
 
-- この project は現時点で **完成** 扱い (README「Development status」参照)。
+- 忍者スプライト・サブエージェント分身に対応。以降は明示された変更のみ行う。
 - Claude Code の状態を手元で確認するために作った個人用の小さなツール。
 - 必要な機能だけを最小構成で実装している。
 - **明示依頼なしに機能追加・大規模リファクタ・UI 刷新をしない。**
@@ -18,9 +18,11 @@
   .NET Framework 4.8 同梱の csc.exe でビルドするため **C# 5 構文のみ**。
 - Electron / WebView / Chromium / Node 常駐を導入しない。
 - localhost server / DB を導入しない。全て in-memory・永続化なし。
-- 完全 event-driven。polling しない。idle 時は `GetMessage` でブロック。
-- 常時 timer を増やさない。timer は animation / grace / 表示期限の one-shot のみ。
-- idle 時 CPU ほぼ 0・RAM 十数 MB を維持する。
+- 状態監視は event-driven。polling しない。アニメーションtimerは表示中のみ。
+- Idleは4秒静止後80ms間隔で短い瞬き。Workingは200ms、分身400ms、Success160ms。
+  静止中は次の変化までtimerを寝かせ、非表示中・one-shot終了後は停止する。
+- 待機・作業ではmotionRegions外をframe 0で固定し、頭・足・マフラーを揺らさない。
+- 旧版のCPU/RAM実測を新版へ流用しない。HUDはキャッシュし、フレームで再生成しない。
 - click-through / 背景透過 / always-on-top / タスクバー非表示という
   現在の UI 特性を壊さない。
 - TOPMOST の再保証は event-driven のみ (表示内容の変化時と明示操作時)。
@@ -28,7 +30,7 @@
   focus を奪う経路 (自動での SetForegroundWindow 等) を追加しない。
 - 通知領域アイコンは Shell_NotifyIcon の純 Win32 実装 1 つだけ。
   WinForms NotifyIcon / 別常駐 helper を導入しない。
-  「ヒヨコを隠す」は visual hide であり、hooks 受信・進捗・完了判定は
+  「忍者を隠す」は visual hide であり、hooks 受信・進捗・完了判定は
   hidden 中も継続する (hidden 中は完了音を鳴らさない)。
 
 ## Privacy
@@ -124,3 +126,13 @@ Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節�
 - docs/DESIGN_DECISIONS.md (過去の判断と不採用案)
 - 該当 source (`src/Pet.cs` / `src/Notify.cs`)
 - 該当 git history
+
+## Ninja sprite / subagents
+
+- メインと分身は同じ埋込PNGを使用。フレーム仕様は `assets/ninja/ninja.json`。
+- 分身は表示中sessionの観測したidentityのみ。最大6体 + 超過件数。
+- Claude event 12/13を追加。既存1〜11および3行payloadを維持。
+- Codex event 26/27のextraにhash化したagent identityを追加。4行payloadを維持。
+- identity本文は表示・ログへ出さず、adapter内でSHA-256化。nested本文から抽出しない。
+- 分身は親を完了させない。Codexのsubagent検知後の進捗抑制を維持する。
+- `test.ps1` とbuildを実行する。Hook設定更新はユーザー承認を得てから行う。

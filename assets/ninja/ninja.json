@@ -1,0 +1,16 @@
+{
+  "cellWidth": 128,
+  "cellHeight": 128,
+  "idle": {
+    "row": 0, "frames": 8, "frameMs": 80, "holdMs": 4000, "loop": true,
+    "motionRegions": [
+      { "x": 31, "y": 53, "width": 58, "height": 20 },
+      { "x": 33, "y": 85, "width": 61, "height": 19 }
+    ]
+  },
+  "working": {
+    "row": 1, "frames": 8, "frameMs": 200, "cloneFrameMs": 400, "loop": true,
+    "motionRegions": [ { "x": 38, "y": 76, "width": 50, "height": 27 } ]
+  },
+  "success": { "row": 2, "frames": 8, "frameMs": 160, "loop": false }
+}
