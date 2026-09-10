@@ -49,6 +49,7 @@ namespace ClaudePetNotify
         private const int EvTaskInProgress = 10; // TaskUpdate(in_progress) (extra=task_id)
         private const int EvSubagentStart = 12;
         private const int EvSubagentStop = 13;
+        private const int EvStopFailure = 14;
         private const int EvSessionMetadata = 11; // SessionStart (extra=model identifier)
 
         // model identifier の長さ上限。payload は行区切りなので
@@ -252,6 +253,11 @@ namespace ClaudePetNotify
                         case "Stop":
                             if (agentId.Length > 0) return 0; // 内部subagentの完了は通知しない
                             eventType = EvTaskComplete;
+                            extra = BackgroundWork.Read(json);
+                            break;
+                        case "StopFailure":
+                            if (agentId.Length > 0) return 0;
+                            eventType = EvStopFailure;
                             break;
                         case "UserPromptSubmit":
                             eventType = EvPromptSubmit;
@@ -345,32 +351,14 @@ namespace ClaudePetNotify
                 }
 
                 bool ok = SendEvent(hwnd, eventType, sessionId + "\n" + project + "\n" + extra);
-                DebugLog(eventType, sessionId, project + " extra=" + ((eventType == 12 || eventType == 13) ? (extra.Length > 0 ? "present" : "missing") : extra) + " " + EnvSummary(),
+                DebugLog(eventType, sessionId, project,
                     ok ? "sent" : "SEND-FAIL err=" + Marshal.GetLastWin32Error());
             }
             catch { }
             return 0;
         }
 
-        private static string Short(string s)
-        {
-            return s.Length > 8 ? s.Substring(0, 8) : s;
-        }
-
-        private static string EnvSummary()
-        {
-            string[] names = { "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT" };
-            var sb = new StringBuilder();
-            foreach (string n in names)
-            {
-                string v = Environment.GetEnvironmentVariable(n);
-                sb.Append(n.Replace("CLAUDE_CODE_", "").Replace("CLAUDE", "C")).Append('=')
-                  .Append(v == null ? "-" : Short(v)).Append(' ');
-            }
-            return sb.ToString();
-        }
-
-        // bin\debug.flag が存在するときだけ bin\debug.log へイベントを追記する (通常は完全に無効)。
+        // bin\debug.flag が存在するときだけ bin\status-debug.log へイベントを追記する (通常は完全に無効)。
         // 併走プロセスと衝突しないよう FileShare.ReadWrite の追記ストリームを使う。
         private static void DebugLog(int eventType, string sessionId, string project, string note)
         {
@@ -380,8 +368,8 @@ namespace ClaudePetNotify
                 if (!File.Exists(Path.Combine(dir, "debug.flag"))) return;
                 byte[] line = Encoding.UTF8.GetBytes(
                     DateTime.Now.ToString("HH:mm:ss.fff") + " ev=" + eventType +
-                    " sess=" + sessionId + " proj=" + project + " " + note + "\r\n");
-                using (var fs = new FileStream(Path.Combine(dir, "debug.log"),
+                    " outcome=" + (note == "sent" ? "sent" : note.StartsWith("drop:") ? "dropped" : eventType == 0 ? "suppressed" : "send-failed") + "\r\n");
+                using (var fs = new FileStream(Path.Combine(dir, "status-debug.log"),
                     FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
                 {
                     fs.Write(line, 0, line.Length);
@@ -481,28 +469,12 @@ namespace ClaudePetNotify
             return sb.ToString();
         }
 
-        // PostToolUse(TodoWrite) の tool_input 内の "status" 値だけを数えて
-        // "completed/in_progress/total" を返す。todo 本文は読まない・送らない。
-        // tool_response 以降は数えない (echo による二重カウント防止)。
-        // TodoWrite が空リスト (全消去) のときは "0/0/0" を返し、Pet 側で進捗表示を消す。
+        // Structured statuses determine progress; the single active label is display-only.
         private static string CountTodoStatuses(string json)
         {
-            int start = json.IndexOf("\"tool_input\"", StringComparison.Ordinal);
-            if (start < 0) return null;
-            int end = json.IndexOf("\"tool_response\"", start, StringComparison.Ordinal);
-            string region = (end > start) ? json.Substring(start, end - start) : json.Substring(start);
-
-            int total = 0, done = 0, inProg = 0;
-            foreach (Match m in Regex.Matches(region, "\"status\"\\s*:\\s*\"(pending|in_progress|completed)\""))
-            {
-                total++;
-                if (m.Groups[1].Value == "completed") done++;
-                else if (m.Groups[1].Value == "in_progress") inProg++;
-            }
-            return done + "/" + inProg + "/" + total;
+            return WorkDetails.Snapshot(json, false);
         }
 
-        // TaskUpdate の tool_input から taskId と status だけを取り出す (本文は読まない)
         private static void ParseTaskUpdate(string json, out string taskId, out string status)
         {
             taskId = ""; status = "";

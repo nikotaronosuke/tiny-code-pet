@@ -22,7 +22,7 @@
 - Idleは4秒静止後80ms間隔で短い瞬き。Workingは200ms、分身400ms、Success160ms。
   静止中は次の変化までtimerを寝かせ、非表示中・one-shot終了後は停止する。
 - 待機・作業ではmotionRegions外をframe 0で固定し、頭・足・マフラーを揺らさない。
-- 旧版のCPU/RAM実測を新版へ流用しない。HUDはキャッシュし、フレームで再生成しない。
+- 旧版のCPU/RAM実測を新版へ流用しない。HUDはキャッシュし、表示が変わった場合だけ再生成する。経過秒の更新は表示中の既存animation timerを利用し、TOPMOSTは再保証しない。
 - click-through / 背景透過 / always-on-top / タスクバー非表示という
   現在の UI 特性を壊さない。
 - TOPMOST の再保証は event-driven のみ (表示内容の変化時と明示操作時)。
@@ -39,14 +39,16 @@
 - source code 本文を進捗推定に使わない。
 - API key / secret を扱わない。
 - Hook payload からは status metadata (hook_event_name / session_id / cwd /
-  agent_id / tool_name / task の status・id) だけを読む方針を維持。
+  agent_id / tool_name / task の status・id) を使用する。
+- ユーザー依頼により、表示専用に単一in_progress工程のstep / activeForm / contentも読む。
+  120文字上限・制御文字除去・メモリ内のみ。工程名をログ・進捗算定・完了判定に使わない。
 - ネットワーク送信・履歴 DB を追加しない。
 
 ## Visible states (完全 auto 運用)
 
 - 見える状態は Idle /「作業中…」/「終わったよ！」の 3 つだけ。
   確認要求 UI・警告音・activity indicator・**「未完了」表示**は廃止済み。復活させない。
-- Waiting も Finalizing (Stop 後の静穏待ち) も描画は「作業中…」。
+- タイトルはWaiting / Finalizingも「作業中…」。補助行には入力・承認待ち / 終了通知後の待機中を表示する。
 - 「終わったよ！」は約5秒の一時通知で、その後は Idle。
 - 表示priority は **active (Working/Waiting/Finalizing) > Celebrating**。
   過去の完了通知で進行中の作業を隠さない。
@@ -67,13 +69,16 @@
   stale な高値の固定はしない。
 - UI 表示は「全体 推定 N%」。Task 件数 (3/5 等) は出さない。
 - ETA を出さない。経過時間や tool 実行回数を進捗率として使わない。
+- 経過時間は依頼単位の単調時計。PromptSubmitを観測できない場合は「観測から」。
+  非表示中は描画せず、再表示で追いつく。無反応でも時計が進むため稼働証明にはしない。
+- snapshot extraはc/i/t|base64(active label)。旧c/i/tも受信可能。3行/4行の数は維持。
 - 追加の LLM call で進捗を問い合わせない。
 
 ## Completion philosophy
 
 - **progress と completion は完全に独立**。structured tracker は進捗の
   推定材料であって、終了の証拠ではない。
-- 完了 = **root Stop + `CompletionQuietMs` (20 秒) の静穏**。これだけ。
+- 完了 = **背景作業による保留のないroot Stop + `CompletionQuietMs` (20 秒) の静穏**。
   provider 共通で、Claude / Codex とも同じ値を使う。
 - `FinalizeDue` は tracker (`GetProgress` / `SawStructuredTasks` / `SnapTotal`)
   を読まない。この不変条件を壊さない。
@@ -94,14 +99,17 @@ Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節�
   - 正規化イベント 1〜10 の意味を変えない。
   - Claude payload は 3 行のまま (4 行目の turn_id は Codex 専用)。
   - nested Claude suppression を変えない。
-  - status 本文 (Todo/Task/plan step/command/response) を読まない。
+  - 表示専用のactive工程名以外の本文 (command/response等) を読まない。
   - `structured-observed` は固定 metadata のみ。本文を乗せない。
   - event 11 (SessionStart) は model 表示用 metadata 専用。これだけで
     「作業中…」にしないし active session にも数えない。
-  - root Stop は常に Finalizing (quiet window) へ入る。completion を決めるのは
+  - root Stop の background_tasks にmonitor以外のin-flight作業があればWorkingで保留。
+    欠落は旧方式へfallback、空配列と区別。不正metadataは保留。本文は読まない。
+    常設monitor・session_cronsは現在turnの終了条件にしない。
+  - 保留のないroot Stop は Finalizing (quiet window) へ入る。completion を決めるのは
     `FinalizeDue` だけ (早期 celebration 禁止)。
 - Codex 側 (`src/CodexNotify.cs` + `Pet.cs` の `OnCodexEvent`):
-  - dwData 20〜27 が Codex 専用範囲。1〜10 へ混ぜない。
+  - dwData 20〜28 が Codex 専用範囲。1〜10 へ混ぜない。
   - 内部 key は `codex:<session_id>`。状態は provider + session + **turn** で分ける。
     current turn 以外の遅延イベントを UI へ反映させない (実測 18.6 秒遅延あり)。
   - Codex の `Stop` は完了確定ではない。`CompletionQuietMs` の静穏を
@@ -134,5 +142,7 @@ Codex 対応は実装済み (docs/DESIGN_DECISIONS.md の「Codex support」節�
 - Claude event 12/13を追加。既存1〜11および3行payloadを維持。
 - Codex event 26/27のextraにhash化したagent identityを追加。4行payloadを維持。
 - identity本文は表示・ログへ出さず、adapter内でSHA-256化。nested本文から抽出しない。
+- Claude event 14 (StopFailure) / Codex event 28 (Interrupt) は完了候補を破棄して静かに終了。
+  Codexはturn一致必須。遅延イベントで中断したturnを復活させない。
 - 分身は親を完了させない。Codexのsubagent検知後の進捗抑制を維持する。
 - `test.ps1` とbuildを実行する。Hook設定更新はユーザー承認を得てから行う。

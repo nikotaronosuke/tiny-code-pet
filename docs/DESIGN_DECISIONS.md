@@ -216,7 +216,7 @@ pending 残 / in_progress 残 / interrupt / subagent はすべて「未完了」
 `TimerNotice` / `RenderIncomplete` / `IncompleteNoticeTtl`) はすべて削除した。
 
 
-## completion = root Stop + 20 秒静穏 (現在の仕様, 2026-08)
+## completion = root Stop + 20 秒静穏 (2026-08; 2026-09の補助情報は末尾参照)
 
 ### progress と completion を完全に分離した
 
@@ -891,3 +891,162 @@ Codexの非管理Hookはユーザーの信頼操作が必要。信頼状態を�
 現行の公式仕様ではHookは既定で有効となっているため、install-codex-hook.ps1は
 明示的な `hooks = true` がないことだけを理由に「無効」と断定しない。
 config.tomlを変更しない方針は維持する。
+
+## 2026-09: 背景作業・異常終了・中断の補助情報
+
+ユーザー承認に基づき、2026-09-10の再調査結果をローカルへ反映。
+既存の20秒静穏と継続時の候補取消しを維持し、次を追加した。
+
+- Claude Stopのextraへbackground-unknown / background-clear / background-pendingを渡す。
+  pendingならWorkingへ戻して候補を取り消す。新しいroot Stopが必要。
+  欠落は旧方式を維持し、空配列とは区別する。不正metadataはpending。
+- 公式のin-flight配列にあるmonitor以外の作業を保留対象にする。
+  monitorとsession_cronsはこのturnの完了条件から外す。
+  shellが常設かは本文を読まないので判断せず、保守的に保留する。
+- Claude StopFailureはevent 14。状態削除とtombstoneで遅延Stop/activityを抑制する。
+- Codex Interruptはevent 28。turn一致を必須とし、状態と候補を破棄する。
+  中断後の遅延PermissionRequestもtombstoneを解除しない。
+- 上記の中断・失敗で完了音を鳴らさない。進捗件数は完了判定に使わない。
+
+既知の限界: Claudeの既存3行契約にはturn identityがなく、新しい依頼の後に
+前依頼の非同期イベントが届いた場合の完全な識別はできない。
+背景作業が終わっても新しいroot Stopが届かなければ通知しない。
+予約された作業の達成や成果物の正しさを保証するものではない。
+
+変更箇所: src/BackgroundWork.cs、src/Notify.cs、src/CodexNotify.cs、src/Pet.cs、
+各Hookインストーラ、build.ps1、test.ps1、tests/NinjaTests.cs。
+ローカルの未コミット変更であり、GitHub公開済みとは扱わない。
+
+検証: test.ps1で66 assertions PASS、500frames GDI delta=0。
+ステージングbuild成功、3つのexeをバックアップ後にローカルbinへ反映し、
+Petのみ再起動、実行ファイルのハッシュ一致を確認。
+Codex adapterの合成入力3件（Interrupt、計画件数、Stop）も正常。
+これは実AIのInterrupt/StopFailure配信・長時間作業の結合確認ではない。
+
+計画ツール: 利用者設定に tools.update_plan.enabled = true を追加。
+現在の応答で提供済みのツール一覧は変化せず、次の応答での実提供・Hook到達は未確認。
+Hook設定: StopFailureとInterruptを追加。公式hooks/listでは設定エラー0、
+従来7イベントtrusted、新規Interruptのみuntrusted。信頼操作は未完了。
+
+App Server: 現在のDesktopに関連するプロセスはlistener指定なし、または明示stdio。
+外部購読可能なWebSocket/Unix listener指定は観測されなかった。
+別App ServerはDesktop既存turnの通知購読を証明しないため採用しない。
+一時的な診断プロセスではinitializeとhooks/listのみを実行して終了した。
+モデル推論・会話開始・常駐監視は行っていない。
+
+根拠: docs/PROGRESS_COMPLETION_REVIEW.md と公式Hooks/App Server仕様。
+
+追記: 新規Interruptの信頼操作もユーザーから委任され、公式CLIのHooksレビューで
+対象コマンド・イベント・3秒timeoutを確認して、その1件のみ承認した。
+再度hooks/listを実行し、全8件enabled/trusted・設定エラー0を確認。
+上記の「信頼操作は未完了」はこの確認により解消済み。
+
+### 実受信の検証追記（2026-09-10）
+
+- 現在のDesktop会話からPostToolUse(21)がPetへ届き、Working・candidate=falseとなることを確認。
+- 実時間25秒のshell待機中、Stop 0件・完了遷移0件。Petは稼働を継続。
+- 合成入力11件を実adapterへ与え、実Petの受信状態7条件を確認。
+  計画1/1/4で37%、StopでFinalizing、Interruptで削除、遅延Stopは無効。
+  Claude背景shellのStopはWorking継続、StopFailure後の遅延Stopも無効。
+- 合成入力と実AIによるHook発火は別。計画ツールは現在の会話にまだ提供されていない。
+- config/readのToolsV2出力schemaはweb_searchしか公開しない。このAPIにupdate_planが
+  出ないことを「設定がfalse」と解釈してはいけない。ファイル上はtrueを維持。
+- 実AIでの追加テストは自動承認レビューに拒否されたため未実行。
+  理由は追加モデル呼び出しの利用枠・料金消費に対する明示承認不足。
+  現行会話の観測とローカル合成テストのみを実施した。
+
+診断時の個人情報保護のため、既存debug.flagで有効になるログをstatus-debug.logへ変更。
+イベント種別、状態、推定進捗、候補有無、送信成否のみを記録し、session/turn/project/
+prompt/応答/環境変数値/座標は出力しない。fixtureの識別子・本文が出力にないことも確認。
+診断終了時に今回作ったdebug.flagを除去し、通常の無記録状態へ戻した。
+変更はローカルの未コミット状態。実AIの進捗・完了・中断の結合検証は完了扱いにしない。
+
+### 許可された実AI検証3回の結果
+
+利用者が最大3回を明示承認し、以下の3実行を行った。追加実行はしていない。
+
+1. Codex CLI（永続化なし）: 実update_plan -> Pet event22で25%、shellの25秒待機、
+   実update_plan -> 100%、root Stop -> Finalizing、SessionEndでも候補維持。
+   実行終了コード0。20秒後は他のactive（本会話）があるため既存仕様どおり通知抑制。
+   完了音が実際に鳴った検証ではない。
+2. Codex一時App Server: テストturnのcommandExecution開始後にturn/interrupt。
+   実turn.status=interrupted、Pet event28受信でstate=0/candidate=falseを確認。
+   一時プロセスは終了し、監視サービスは追加していない。
+3. Claude CLI（永続化なし）: 実StopとSessionEndを受信。Stopのbackground_tasksと
+   session_cronsフィールドは存在し、背景件数は0だった。ツール実行は観測されず、
+   指定した背景sleepを起動するケースには到達していない。終了コード0は
+   背景作業保留の実AI検証成功を意味しない。StopFailureも実AIでは未観測。
+
+CLIで計画ツールが動いたので、設定とPet受信経路は実証された。一方、現在のDesktopの
+本会話にはupdate_planがまだ提供されていない。この会話の進捗表示復旧は未完了。
+Desktopの設定再読込・既存会話への適用は別途必要であり、再起動で直ると断定しない。
+本会話を終了するアプリ再起動は今回行っていない。
+
+実行記録はbin/LIVE_TEST_USAGE.md（ignored）。診断記録はstatus metadataのみ。
+診断終了後は今回作成したdebug.flagを除去する。
+
+### Desktop進捗設定の反映調査
+
+DesktopとCLIは同じCodex実行ファイルを利用。関連プロセスの起動引数に
+計画ツールのfalse指定やprofile指定は確認されなかった。
+公式mainのspec_plan.rsではturn_context.config.update_plan_enabledにより
+PlanHandlerを登録する。既存Desktop会話が旧設定を保持している可能性を調べるため、
+Desktopとその子孫に属するApp Serverを再起動して再読込する方針とした。
+これは原因確定ではなく切り分けであり、再起動後のツール提供確認が必要。
+
+以前の子プロセス型再起動helperがアプリと一緒に終了した経験を踏まえ、
+一回限りのWindowsタスクで独立ランチャーを用意。Preflightを実行し、
+IndependentLauncherReady=Trueを確認。停止対象は取得済みPID・起動時刻・実行パスを
+照合したDesktop本体と、その子孫のApp Serverのみ。Petは停止しない。
+ランチャーは実行後に自分の一回限りタスクを解除する。
+新規モデル呼び出し・追加AIテストはしていない。
+
+### Desktop進捗表示の復旧確認（2026-09-10 12:44 JST）
+
+独立ランチャーの結果はAppRestarted=True。再起動後の本会話にupdate_planが提供され、
+本会話から実際に更新した計画（completed 1 / in_progress 1 / total 3）が
+Codex event22として実Petへ届き、state=Working / progress=50 / candidate=Falseを確認。
+CLIだけでなく、このDesktopの既存会話についても進捗入力の復旧を確認できた。
+再起動前の設定保持が原因だったことを支持する実測結果であり、追加モデルテストは不要だった。
+
+再起動直後のランチャー記録ではPetRunning=Falseだった。Petを明示的に停止する命令は
+出していないが、「Petは動いたまま」とした事前説明は結果と一致しなかった。
+戻ったメッセージの後にはPetが自動起動しており、稼働と検証済みbinaryの一致を確認。
+再起動用の一回限りタスクも解除済み。
+
+この項目はDesktopの進捗復旧だけを完了する。Claudeの背景作業・StopFailureの実AI検証、
+他のactiveがない場合の実完了音、GitHub反映は別の未完了項目として残る。
+
+
+## Current work and elapsed time (2026-09-10)
+
+ユーザーの明示依頼により、進捗率に計画上の現在工程と依頼の経過時間を追加。
+本文非読取の例外は単一in_progressの工程名(step / activeForm / content)だけとする。
+工程名は進捗計算・完了判定に使わず、最大120文字でメモリ内だけに保持する。
+未知・並行工程・subagent由来の疑いは工程名を出さず、実行中のコマンドを推測しない。
+
+既存snapshotイベントのextraをc/i/t|base64(label)へ拡張。改行数とイベント番号は変更せず、
+新Petは旧c/i/tも受信する。旧Petは拡張snapshotを解釈できないため、Petとadapterを一緒に更新する。
+status件数も同じ構造走査に移し、tool_responseや工程名内のstatus文字列を数えない。
+Prompt・応答・commandは構造を飛ばすだけでdecodeしない。新しい依存package・Hookは追加しない。
+
+経過時間はStopwatchの単調時計で、PromptSubmitの受信時にリセット。
+開始を未観測ならsession初観測から計測し「観測から」と表記する。
+表示中の既存animation tickを利用し、秒が変わったときだけHUDを更新。
+非表示では停止、再表示時に追いつく。時計更新ではTOPMOST再保証を行わない。
+経過時間は稼働の証明・ETA・進捗の補間・完了条件にしない。
+
+HUDの上端領域を60px増やし、忍者の画面上の位置は維持する。
+工程名は最大2行で省略し、進捗率のない場合にも経過時間を表示する。
+Waiting / Finalizingはタイトルを維持し、補助行のみ実際の待機状態を示す。
+
+検証: 85 assertions PASS、build成功、500フレーム後GDI delta=0。
+status抽出境界、ラベルの制御文字・長さ制限、旧payload、旧turn、新依頼リセット、
+並行工程・subagent抑制、単調時計の時表示境界、HUDキャッシュ、非表示停止と再表示を確認。
+100/125/200%のオフスクリーン描画を生成し、通常工程名と長い工程名の収まりを確認した。
+
+ローカルのPet/両adapterをバックアップ後に反映し、配置binaryがstageと一致することを確認。
+実Desktop会話のupdate_planからevent22、progress=83、workLabel=Trueを受信した。
+更新途中のPet再起動で開始Hookは未観測のためobservedStart=Falseとなり「観測から」で表示。
+次のPromptSubmitで依頼開始の時計へ切り替わる。追加のモデルテスト・Hook設定変更は行っていない。
+診断flagは検証後に除去。今回の変更はローカルのみで、commit/pushは未実施。

@@ -27,6 +27,33 @@ internal static class NinjaTests
     private static void Run(string output)
     {
         Directory.CreateDirectory(output);
+        Check(BackgroundWork.Read("{}") == BackgroundWork.Missing,"older Stop metadata stays unknown");
+        Check(BackgroundWork.Read("{\"background_tasks\":[]}") == BackgroundWork.Clear,"empty background registry");
+        Check(BackgroundWork.Read("{\"background_tasks\":[{\"type\":\"shell\",\"status\":\"running\"}]}") == BackgroundWork.Pending,"background shell blocks completion");
+        Check(BackgroundWork.Read("{\"background_tasks\":[{\"type\":\"subagent\"}]}") == BackgroundWork.Pending,"background subagent blocks completion");
+        Check(BackgroundWork.Read("{\"background_tasks\":[{\"type\":\"monitor\"}],\"session_crons\":[{\"recurring\":true}]}") == BackgroundWork.Clear,"persistent monitoring does not block forever");
+        Check(BackgroundWork.Read("{\"background_tasks\":[{\"type\":\"monitor\"},{\"type\":\"shell\"}]}") == BackgroundWork.Pending,"monitor cannot hide finite work");
+        Check(BackgroundWork.Read("{\"background_tasks\":null}") == BackgroundWork.Pending,"null registry is not empty");
+        Check(BackgroundWork.Read("{\"background_tasks\":[}") == BackgroundWork.Pending,"malformed registry fails closed");
+        Check(BackgroundWork.Read("{\"background_tasks\":[],\"background_tasks\":[]}") == BackgroundWork.Pending,"duplicate metadata fails closed");
+        Check(BackgroundWork.Read("{\"tool_response\":{\"background_tasks\":[]}}") == BackgroundWork.Missing,"nested registry cannot authorize completion");
+        Check(BackgroundWork.Read("{\"last_assistant_message\":\"fake \\\"background_tasks\\\":[]\",\"background_tasks\":[{\"type\":\"shell\"}]}") == BackgroundWork.Pending,"response text cannot authorize completion");
+
+        string plan = WorkDetails.Snapshot("{\"prompt\":\"ignored\",\"tool_input\":{\"plan\":[{\"step\":\"済\",\"status\":\"completed\"},{\"step\":\"表示を検証する\",\"status\":\"in_progress\"},{\"step\":\"後\",\"status\":\"pending\"}]},\"tool_response\":{\"status\":\"completed\"}}",true);
+        Check(plan.StartsWith("1/1/3|") && WorkDetails.Label(plan)=="表示を検証する","active plan label and counts ignore response");
+        Check(WorkDetails.Snapshot("{\"tool_response\":{\"tool_input\":{\"plan\":[]}}}",true)==null,"nested plan is not input");
+        Check(WorkDetails.Snapshot("{\"tool_input\":{\"plan\":[{\"status\":\"unknown\"}]}}",true)==null,"unknown status cannot inflate progress");
+        Check(WorkDetails.Snapshot("{\"tool_input\":{\"plan\":[],\"plan\":[]}}",true)==null,"duplicate plan rejected");
+        Check(WorkDetails.Snapshot("{\"tool_input\":{\"plan\":[{\"status\":\"pending\"},]}}",true)==null,"trailing comma rejected");
+        string todo=WorkDetails.Snapshot("{\"tool_input\":{\"todos\":[{\"content\":\"check\",\"activeForm\":\"確認しています\",\"status\":\"in_progress\"}]}}",false);
+        Check(WorkDetails.Label(todo)=="確認しています","Claude activeForm label");
+        Check(WorkDetails.Label(WorkDetails.Snapshot("{\"tool_input\":{\"todos\":[{\"content\":\"確認する\",\"status\":\"in_progress\"}]}}",false))=="確認する","Claude content fallback");
+        Check(WorkDetails.Snapshot("{\"tool_input\":{\"todos\":[]}}",false)=="0/0/0|","empty plan clears details");
+        Check(WorkDetails.Label("1/1/3")=="" && WorkDetails.Label("1/1/3|!!!")=="","legacy and malformed title safe");
+        Check(WorkDetails.Label(WorkDetails.Snapshot("{\"tool_input\":{\"plan\":[{\"step\":\"a\",\"status\":\"in_progress\"},{\"step\":\"b\",\"status\":\"in_progress\"}]}}",true))=="","multiple active steps do not imply a single current task");
+        Check(WorkDetails.Clean("a\nb\u202ec")=="a b c" && WorkDetails.Clean(new string('x',200)).Length==120,"bounded single-line labels");
+        Check(WorkDetails.Elapsed(3599000,true)=="経過 59:59" && WorkDetails.Elapsed(3600000,true)=="経過 1:00:00","elapsed hour boundary");
+        Check(WorkDetails.Elapsed(-1,false)=="観測から 00:00","unknown request start is explicit");
         var roster = new SubagentRoster();
         roster.Apply(true,"a"); roster.Apply(true,"a"); Check(roster.Count==1,"duplicate start");
         roster.Apply(false,"a"); roster.Apply(false,"a"); roster.Apply(true,"a"); Check(roster.Count==0,"stop tombstone");
@@ -96,26 +123,56 @@ internal static class NinjaTests
             Claude(app,12,"late"); Check(c.Subagents.Count==0,"no clones after completion");
             Call(app,"OnRevert"); Check(sessions.Count==0,"celebration cleanup");
 
+            Claude(app,2,""); c=sessions["fixture-session"];
+            c.LastAtUtc=DateTime.UtcNow.AddMinutes(-10);
+            Call(app,"FinalizeDue"); Check(c.State==Session.Working,"long silence without Stop never completes");
+            Claude(app,1,BackgroundWork.Pending);
+            Call(app,"FinalizeDue"); Check(c.State==Session.Working && c.QuietDueUtc==DateTime.MinValue,"background Stop has no completion deadline");
+            Claude(app,1,BackgroundWork.Clear); Claude(app,14,"");
+            Claude(app,1,BackgroundWork.Clear); Claude(app,4,"");
+            Call(app,"FinalizeDue"); Check(!sessions.ContainsKey("fixture-session"),"failure cancels quiet and rejects late work/Stop");
+            Claude(app,2,""); Claude(app,1,BackgroundWork.Missing);
+            c=sessions["fixture-session"]; Check(c.State==Session.Finalizing,"legacy Stop retains quiet fallback");
+            Claude(app,1,BackgroundWork.Pending);
+            Check(c.State==Session.Working && c.QuietDueUtc==DateTime.MinValue,"background Stop cancels older clear Stop");
+            Claude(app,5,"");
+
             Codex(app,20,"","turn-a"); Codex(app,22,"1/1/4","turn-a");
             Session d=sessions["codex:fixture-session"]; Check(d.ProgressPercent()==37,"root plan unchanged");
-            Codex(app,26,"a","turn-a"); Check(d.Subagents.Count==1 && d.ProgressPercent()==-1,"Codex fail-closed progress");
+            long started = d.StartedTick;
+            Codex(app,22,plan,"turn-a");
+            Check(d.CurrentWork=="表示を検証する" && d.ProgressPercent()==50 && d.StartedTick==started,"plan title updates without resetting elapsed");
+            Codex(app,22,"2/0/2|","old-turn");
+            Check(d.CurrentWork=="表示を検証する","old turn cannot replace current title");
+            Codex(app,26,"a","turn-a"); Check(d.CurrentWork=="" && d.Subagents.Count==1 && d.ProgressPercent()==-1,"Codex fail-closed progress");
             Codex(app,26,"b","old-turn"); Check(d.Subagents.Count==1,"old turn start rejected");
             Codex(app,27,"a","old-turn"); Check(d.Subagents.Count==1,"old turn stop rejected");
             Codex(app,25,"","old-turn"); Check(sessions.ContainsKey("codex:fixture-session") && d.Subagents.Count==1,"old session end rejected");
             Codex(app,27,"a","turn-a"); Codex(app,22,"4/0/4","turn-a");
             Check(d.State==Session.Working && d.ProgressPercent()==-1 && d.Subagents.Count==0,"child stop preserves fail-closed");
-            Codex(app,20,"","turn-b"); Check(!d.TurnHasSubagent && d.Subagents.Count==0,"new Codex turn resets");
+            Codex(app,20,"","turn-b"); Check(d.CurrentWork=="" && d.ObservedStart && d.StartedTick>=started && !d.TurnHasSubagent && d.Subagents.Count==0,"new Codex turn resets");
+            Codex(app,24,"","turn-b"); Codex(app,28,"","turn-a");
+            Check(d.State==Session.Finalizing,"old turn interrupt cannot cancel current Stop");
+            Codex(app,28,"",""); Check(d.State==Session.Finalizing,"missing interrupt turn ignored");
+            Codex(app,28,"","turn-b"); Codex(app,24,"","turn-b"); Codex(app,21,"","turn-b");
+            Codex(app,23,"","turn-b"); Codex(app,24,"","turn-b");
+            Call(app,"FinalizeDue"); Check(!sessions.ContainsKey("codex:fixture-session"),"interrupt cancels completion and rejects late events");
+            Codex(app,20,"","turn-b"); d=sessions["codex:fixture-session"];
             Codex(app,26,"c","turn-a"); Check(d.Subagents.Count==0,"delayed prior turn rejected");
             Claude(app,2,""); Claude(app,12,"a"); Codex(app,26,"a","turn-b");
             Check(sessions.Count==2 && sessions["fixture-session"].Subagents.Count==1 && d.Subagents.Count==1,"provider isolation");
             Claude(app,1,""); c=sessions["fixture-session"]; c.QuietDueUtc=DateTime.UtcNow.AddSeconds(-1);
             Call(app,"FinalizeDue"); Check(!sessions.ContainsKey("fixture-session") && d.State==Session.Working,"other active suppresses completion");
 
-            Set(app,"_winW",280); Set(app,"_winH",280); Set(app,"_scale",1f);
-            Set(app,"_hud",PetRenderer.RenderWorking(280,280,1f,"fixture-project",65,"Claude",0));
+            Set(app,"_winW",280); Set(app,"_winH",340); Set(app,"_scale",1f);
+            Set(app,"_hud",PetRenderer.RenderWorking(280,340,1f,"fixture-project",65,"Codex",0,"工程：ビルドと動作検証を行い、仕様を記録する","経過 05:23"));
             Set(app,"_cloneCount",9); Set(app,"_oldCloneCount",9);
             Get<SpriteAnimator>(app,"_sprite").Select(1,0);
             using(Bitmap frame=(Bitmap)Call(app,"ComposeSpriteFrame")) frame.Save(Path.Combine(output,"ninja-working.png"));
+            foreach (float scale in new float[] { 1f, 1.25f, 2f })
+                using (Bitmap preview=PetRenderer.RenderWorking((int)(280*scale),(int)(340*scale),scale,
+                    "fixture-project",65,"Codex · GPT-6-astra",3,"工程："+new string('検',120),"経過 12:34:56"))
+                    preview.Save(Path.Combine(output,"details-"+(int)(scale*100)+".png"));
             for(int i=0;i<16;i++)
             {
                 using(Bitmap frame=(Bitmap)Call(app,"ComposeSpriteFrameAt",(long)i*200)) frame.Save(Path.Combine(output,"working-"+i+".png"));
@@ -145,6 +202,25 @@ internal static class NinjaTests
             Call(app,"HidePet"); Check(Get<int>(app,"_spriteInterval")==0,"hidden timer stopped");
             Get<SpriteAnimator>(app,"_sprite").Select(2,-10000); Set(app,"_petVisible",true); Call(app,"ArmSpriteTimer");
             Check(Get<int>(app,"_spriteInterval")==0,"settled success timer stopped");
+
+            sessions.Clear();
+            Codex(app,20,"","clock-turn");
+            d=sessions["codex:fixture-session"];
+            Codex(app,22,plan,"clock-turn");
+            Set(app,"_winH",340);
+            d.StartedTick=Stopwatch.GetTimestamp()-Stopwatch.Frequency*5;
+            Call(app,"RenderCurrent",true,false);
+            Bitmap cached=Get<Bitmap>(app,"_hud");
+            Call(app,"RenderCurrent",false,false);
+            Check(object.ReferenceEquals(cached,Get<Bitmap>(app,"_hud")),"unchanged clock reuses HUD cache");
+            d.StartedTick-=Stopwatch.Frequency*3;
+            Call(app,"OnSpriteTick");
+            Check(!object.ReferenceEquals(cached,Get<Bitmap>(app,"_hud")) && d.ProgressPercent()==50 && d.QuietDueUtc==DateTime.MinValue,"clock advances without changing progress or completion");
+            Call(app,"HidePet"); cached=Get<Bitmap>(app,"_hud"); d.StartedTick-=Stopwatch.Frequency*3;
+            Call(app,"OnSpriteTick");
+            Check(object.ReferenceEquals(cached,Get<Bitmap>(app,"_hud")) && Get<int>(app,"_spriteInterval")==0,"hidden clock does not redraw");
+            Set(app,"_petVisible",true); Call(app,"RenderCurrent",false,false);
+            Check(!object.ReferenceEquals(cached,Get<Bitmap>(app,"_hud")),"show catches up elapsed time");
 
             // Resource stability of the actual scene composition path.
             for(int i=0;i<20;i++) using(Bitmap frame=(Bitmap)Call(app,"ComposeSpriteFrame")) { }

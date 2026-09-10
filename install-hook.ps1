@@ -43,6 +43,7 @@ function New-HookEntry([string]$cmd, [object]$matcher) {
 # event name -> matcher ($null = no matcher field)
 $events = [ordered]@{
     "Stop"             = $null
+    "StopFailure"      = $null
     "UserPromptSubmit" = $null
     "Notification"     = "permission_prompt"
     "PostToolUse"      = "*"

@@ -51,18 +51,19 @@ $events = [ordered]@{
     "PostToolUse"       = @{ matcher = ".*";  async = $true  }
     "PermissionRequest" = @{ matcher = ".*";  async = $false }
     "Stop"              = @{ matcher = $null; async = $false }
+    "Interrupt"         = @{ matcher = $null; async = $false }
     "SessionEnd"        = @{ matcher = $null; async = $false }
     "SubagentStart"     = @{ matcher = $null; async = $false }
     "SubagentStop"      = @{ matcher = $null; async = $false }
 }
 
-function New-HookEntry([object]$matcher, [bool]$async) {
+function New-HookEntry([object]$matcher, [bool]$async, [int]$timeout = 5) {
     $inner = [pscustomobject]@{
         type           = "command"
         command        = $cmdPosix
         commandWindows = $cmdWin
         async          = $async
-        timeout        = 5
+        timeout        = $timeout
     }
     if ($null -ne $matcher) {
         return [pscustomobject]@{ matcher = $matcher; hooks = @($inner) }
@@ -99,7 +100,8 @@ foreach ($ev in $events.Keys) {
     if ($already) {
         Write-Host "$ev : already installed, skipped"
     } else {
-        $doc.hooks.$ev = @($doc.hooks.$ev) + @((New-HookEntry $spec.matcher $spec.async))
+        $eventTimeout = if ($ev -eq 'Interrupt') { 3 } else { 5 }
+        $doc.hooks.$ev = @($doc.hooks.$ev) + @((New-HookEntry $spec.matcher $spec.async $eventTimeout))
         $mode = if ($spec.async) { "async" } else { "sync" }
         Write-Host "$ev : will install ($mode)"
         $changed = $true

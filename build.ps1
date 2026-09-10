@@ -13,13 +13,13 @@ New-Item -ItemType Directory -Force -Path $output | Out-Null
 
 $common = @("/nologo", "/codepage:65001", "/optimize+", "/warn:4", "/target:winexe")
 
-& $csc @common "/out:$output\ClaudePet.exe" "/r:System.Drawing.dll" "/r:System.Web.Extensions.dll" "/resource:$root\assets\ninja\ninja.png,ninja.png" "/resource:$root\assets\ninja\ninja.json,ninja.json" "$root\src\Pet.cs" "$root\src\SpriteAnimator.cs" "$root\src\SubagentRoster.cs"
+& $csc @common "/out:$output\ClaudePet.exe" "/r:System.Drawing.dll" "/r:System.Web.Extensions.dll" "/resource:$root\assets\ninja\ninja.png,ninja.png" "/resource:$root\assets\ninja\ninja.json,ninja.json" "$root\src\Pet.cs" "$root\src\BackgroundWork.cs" "$root\src\WorkDetails.cs" "$root\src\SpriteAnimator.cs" "$root\src\SubagentRoster.cs"
 if ($LASTEXITCODE -ne 0) { throw "build failed: ClaudePet.exe" }
 
-& $csc @common "/out:$output\ClaudePetNotify.exe" "$root\src\Notify.cs" "$root\src\AgentIdentity.cs"
+& $csc @common "/out:$output\ClaudePetNotify.exe" "/r:System.Web.Extensions.dll" "$root\src\Notify.cs" "$root\src\BackgroundWork.cs" "$root\src\WorkDetails.cs" "$root\src\AgentIdentity.cs"
 if ($LASTEXITCODE -ne 0) { throw "build failed: ClaudePetNotify.exe" }
 
-& $csc @common "/out:$output\CodexPetNotify.exe" "$root\src\CodexNotify.cs" "$root\src\AgentIdentity.cs"
+& $csc @common "/out:$output\CodexPetNotify.exe" "/r:System.Web.Extensions.dll" "$root\src\BackgroundWork.cs" "$root\src\WorkDetails.cs" "$root\src\CodexNotify.cs" "$root\src\AgentIdentity.cs"
 if ($LASTEXITCODE -ne 0) { throw "build failed: CodexPetNotify.exe" }
 
 Write-Host "OK ($OutputDirectory): ClaudePet.exe, ClaudePetNotify.exe, CodexPetNotify.exe"

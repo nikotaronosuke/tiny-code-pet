@@ -8,13 +8,13 @@
 // 契約 (正規化イベント 1〜10 / payload 3 行) を一切変更しないため、共通化ではなく
 // 分離を選んでいる (docs/DESIGN_DECISIONS.md 参照)。
 //
-// Codex 正規化イベント (dwData 20〜27。1〜10 は Claude 専用で意味を変えない):
+// Codex 正規化イベント (dwData 20〜28。1〜10 は Claude 専用で意味を変えない):
 //   20 = codex_prompt_submit    (UserPromptSubmit)  新 turn 登録 + 進捗リセット
 //                                extra = sanitized model identifier (空のこともある)
 //   21 = codex_activity         (PostToolUse)       tool activity
 //   22 = codex_plan_snapshot    (PostToolUse update_plan) extra="c/i/t"
 //   23 = codex_permission       (PermissionRequest) 確認して！
-//   24 = codex_stop             (Stop)              completion candidate (5秒 quiet grace)
+//   24 = codex_stop             (Stop)              completion candidate (20秒 quiet window)
 //   25 = codex_session_end      (SessionEnd)
 //   26 = codex_subagent_start   (SubagentStart)     その turn を「subagent 含む」と mark
 //   27 = codex_subagent_stop    (SubagentStop)      root completion にはしない
@@ -50,6 +50,7 @@ namespace CodexPetNotify
         private const int EvCodexSessionEnd = 25;
         private const int EvCodexSubagentStart = 26;
         private const int EvCodexSubagentStop = 27;
+        private const int EvCodexInterrupt = 28;
 
         // update_plan を観測したが plan の status を解析できなかったときに
         // Activity(21) の extra へ載せる固定 marker。plan step 本文は含まない。
@@ -136,6 +137,10 @@ namespace CodexPetNotify
                         eventType = EvCodexSessionEnd;
                         break;
 
+                    case "Interrupt":
+                        eventType = EvCodexInterrupt;
+                        break;
+
                     case "SubagentStart":
                         eventType = EvCodexSubagentStart;
                         extra = AgentIdentity.Token(json);
@@ -157,7 +162,7 @@ namespace CodexPetNotify
                 if (dryRun)
                 {
                     WriteLine("ev=" + eventType + " sess=" + sessionId + " turn=" + turnId +
-                              " proj=" + project + " extra=" + ((eventType == 26 || eventType == 27) ? (extra.Length > 0 ? "present" : "missing") : extra));
+                              " proj=" + project + " extra=" + ((eventType == 26 || eventType == 27) ? (extra.Length > 0 ? "present" : "missing") : extra.Split('|')[0]));
                     return 0;
                 }
 
@@ -194,7 +199,7 @@ namespace CodexPetNotify
             catch { }
         }
 
-        // bin\debug.flag が存在するときだけ bin\debug.log へ追記する (通常は完全に無効)。
+        // bin\debug.flag が存在するときだけ bin\status-debug.log へ追記する (通常は完全に無効)。
         private static void DebugLog(int eventType, string sessionId, string turnId, string project, string extra, string note)
         {
             try
@@ -203,9 +208,8 @@ namespace CodexPetNotify
                 if (!File.Exists(Path.Combine(dir, "debug.flag"))) return;
                 byte[] line = Encoding.UTF8.GetBytes(
                     DateTime.Now.ToString("HH:mm:ss.fff") + " [codex] ev=" + eventType +
-                    " sess=" + sessionId + " turn=" + turnId + " proj=" + project +
-                    " extra=" + ((eventType == 26 || eventType == 27) ? (extra.Length > 0 ? "present" : "missing") : extra) + " " + note + "\r\n");
-                using (var fs = new FileStream(Path.Combine(dir, "debug.log"),
+                    " outcome=" + (note == "sent" ? "sent" : note.StartsWith("drop:") ? "dropped" : "send-failed") + "\r\n");
+                using (var fs = new FileStream(Path.Combine(dir, "status-debug.log"),
                     FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
                 {
                     fs.Write(line, 0, line.Length);
@@ -306,39 +310,12 @@ namespace CodexPetNotify
             return sb.ToString();
         }
 
-        // PostToolUse(update_plan) の tool_input.plan にある "status" 値だけを数えて
-        // "completed/in_progress/total" を返す。plan の step 本文は読まない・送らない。
-        // 実測 (Phase B) では tool_input.plan は毎回「全量 snapshot」なので冪等。
-        // 領域は tool_input のみ。tool_response / tool_use_id 以降は数えない
-        // (echo による二重カウント防止)。
-        // status を1つも取れなかった場合は null を返し、呼び出し側は snapshot を送らない
-        // (Hook snapshot 欠落を1件実測しているため、捏造せず fail-closed)。
+        // Structured statuses determine progress; the single active label is display-only.
         private static string CountPlanStatuses(string json)
         {
-            int start = json.IndexOf("\"tool_input\"", StringComparison.Ordinal);
-            if (start < 0) return null;
-            int end = EarliestAfter(json, start, "\"tool_response\"", "\"tool_use_id\"");
-            string region = (end > start) ? json.Substring(start, end - start) : json.Substring(start);
-
-            int total = 0, done = 0, inProg = 0;
-            foreach (Match m in Regex.Matches(region, "\"status\"\\s*:\\s*\"(pending|in_progress|completed)\""))
-            {
-                total++;
-                if (m.Groups[1].Value == "completed") done++;
-                else if (m.Groups[1].Value == "in_progress") inProg++;
-            }
-            if (total == 0) return null;
-            return done + "/" + inProg + "/" + total;
+            return WorkDetails.Snapshot(json, true);
         }
 
-        private static int EarliestAfter(string json, int start, string a, string b)
-        {
-            int ia = json.IndexOf(a, start, StringComparison.Ordinal);
-            int ib = json.IndexOf(b, start, StringComparison.Ordinal);
-            if (ia < 0) return ib;
-            if (ib < 0) return ia;
-            return (ia < ib) ? ia : ib;
-        }
 
         private static string ToProjectName(string cwd)
         {

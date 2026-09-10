@@ -26,7 +26,7 @@
 // 「終わったよ！」の意味は「成果物が正しい」ではなく、
 // 「root Stop が来て、その後 20 秒間その作業が再開されなかった」。
 //
-// Codex は provider+session+turn 単位の別イベント系 (dwData 20〜27) で入ってくる。
+// Codex は provider+session+turn 単位の別イベント系 (dwData 20〜28) で入ってくる。
 // quiet window の長さと deadline 管理だけ共通化し、state 遷移・turn 分離は
 // provider ごとに分けたまま (Codex の old-turn 遅延イベントを混ぜない)。
 //
@@ -306,6 +306,7 @@ namespace ClaudePet
         public const int TaskInProgress = 10;   // Task着手 (extra=task_id)
         public const int SubagentStart = 12;
         public const int SubagentStop = 13;
+        public const int StopFailure = 14;
         public const int SessionMetadata = 11;  // SessionStart (extra=model identifier)
                                                 // 表示用 metadata だけ。進捗・完了判定には影響させない
 
@@ -319,7 +320,8 @@ namespace ClaudePet
         public const int CodexSessionEnd = 25;     // SessionEnd
         public const int CodexSubagentStart = 26;  // SubagentStart
         public const int CodexSubagentStop = 27;   // SubagentStop (root completion にしない)
-        public const int CodexLast = 27;
+        public const int CodexInterrupt = 28;
+        public const int CodexLast = 28;
 
         // Activity(4 / 21) の extra に載る固定 marker。structured tracker
         // (TodoWrite / Task 系 / update_plan) を観測したが status を解析できなかった、
@@ -349,6 +351,16 @@ namespace ClaudePet
         // 「依頼 (Request)」= そのセッションで最後に UserPromptSubmit が来てから
         // Stop までの1ターン。新しい依頼が始まったら進捗はリセットする。
         public long RequestGen;
+        public long StartedTick = System.Diagnostics.Stopwatch.GetTimestamp();
+        public bool ObservedStart;
+        public string CurrentWork = "";
+
+        public string ElapsedText()
+        {
+            long ms = (long)((System.Diagnostics.Stopwatch.GetTimestamp() - StartedTick) *
+                1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            return WorkDetails.Elapsed(ms, ObservedStart);
+        }
 
         // 依頼全体の推定進捗 (Claude 自身が認識している Task 群に基づく)。
         // TodoWrite スナップショット (SnapTotal>=0) を優先し、無ければ
@@ -386,6 +398,9 @@ namespace ClaudePet
         public void ResetRequest()
         {
             RequestGen++;
+            StartedTick = System.Diagnostics.Stopwatch.GetTimestamp();
+            ObservedStart = true;
+            CurrentWork = "";
             Subagents.Reset();
             SnapTotal = -1;
             SnapDone = 0;
@@ -519,7 +534,7 @@ namespace ClaudePet
 
             _winW = S(280); // ピル内テキストの幅で決まる (文字サイズを変えないので不変)
             // HUD、96pxメイン忍者、40px分身の専用行を確保する。
-            _winH = S(280);
+            _winH = S(340);
 
             Native.RECT work = new Native.RECT();
             Native.SystemParametersInfo(0x0030 /*SPI_GETWORKAREA*/, 0, ref work, 0);
@@ -533,8 +548,7 @@ namespace ClaudePet
             wc.hInstance = Native.GetModuleHandle(null);
             wc.lpszClassName = WndClassName;
             ushort atom = Native.RegisterClassEx(ref wc);
-            PetDebug("startup: RegisterClassEx atom=" + atom + " err=" + Marshal.GetLastWin32Error() +
-                " dpi=" + _scale + " work=" + _baseX + "," + _baseY + " win=" + _winW + "x" + _winH);
+            PetDebug("startup: class-registered=" + (atom != 0) + " err=" + Marshal.GetLastWin32Error());
 
             _hwnd = Native.CreateWindowEx(
                 Native.WS_EX_LAYERED | Native.WS_EX_TRANSPARENT | Native.WS_EX_TOOLWINDOW |
@@ -543,7 +557,7 @@ namespace ClaudePet
                 _baseX, _baseY, _winW, _winH,
                 IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
 
-            PetDebug("startup: CreateWindowEx hwnd=0x" + _hwnd.ToInt64().ToString("X") +
+            PetDebug("startup: window-created=" + (_hwnd != IntPtr.Zero) +
                 " err=" + Marshal.GetLastWin32Error());
             if (_hwnd == IntPtr.Zero)
             {
@@ -629,7 +643,7 @@ namespace ClaudePet
                 var cds = (Native.COPYDATASTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.COPYDATASTRUCT));
                 int eventType = (int)cds.dwData.ToInt64();
 
-                // Claude (1〜10) は従来どおり3フィールド。Codex (20〜27) だけ
+                // Claude (1〜10) は従来どおり3フィールド。Codex (20〜28) だけ
                 // 4フィールド目に turn_id を持つ。既存 payload 契約は変更しない。
                 bool isCodex = (eventType >= PetEvent.CodexFirst && eventType <= PetEvent.CodexLast);
 
@@ -652,12 +666,18 @@ namespace ClaudePet
 
                 if (isCodex) OnCodexEvent(eventType, sessionId, project, extra, turnId);
                 else OnEvent(eventType, sessionId, project, extra);
-                PetDebug("recv ev=" + eventType + " session=present");
+                Session observed;
+                _sessions.TryGetValue(isCodex ? CodexKey(sessionId) : sessionId, out observed);
+                PetDebug("recv ev=" + eventType + " state=" + (observed == null ? 0 : observed.State) +
+                    " progress=" + (observed == null ? -1 : observed.ProgressPercent()) +
+                    " workLabel=" + (observed != null && !string.IsNullOrEmpty(observed.CurrentWork)) +
+                    " observedStart=" + (observed != null && observed.ObservedStart) +
+                    " candidate=" + (observed != null && observed.QuietDueUtc != DateTime.MinValue));
             }
-            catch (Exception ex) { PetDebug("recv-error " + ex.GetType().Name + " " + ex.Message); }
+            catch (Exception ex) { PetDebug("recv-error " + ex.GetType().Name); }
         }
 
-        // bin\debug.flag が存在するときだけ bin\debug.log へ追記 (通常は完全に無効)。
+        // bin\debug.flag が存在するときだけ bin\status-debug.log へ追記 (通常は完全に無効)。
         // 併走する helper プロセスと衝突しないよう FileShare.ReadWrite の追記ストリームを使う。
         private static void PetDebug(string line)
         {
@@ -667,7 +687,7 @@ namespace ClaudePet
                 if (!System.IO.File.Exists(System.IO.Path.Combine(dir, "debug.flag"))) return;
                 byte[] bytes = System.Text.Encoding.UTF8.GetBytes(
                     DateTime.Now.ToString("HH:mm:ss.fff") + " [pet] " + line + "\r\n");
-                using (var fs = new System.IO.FileStream(System.IO.Path.Combine(dir, "debug.log"),
+                using (var fs = new System.IO.FileStream(System.IO.Path.Combine(dir, "status-debug.log"),
                     System.IO.FileMode.Append, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite))
                 {
                     fs.Write(bytes, 0, bytes.Length);
@@ -714,7 +734,7 @@ namespace ClaudePet
                     s.State = Session.Working;
                     s.QuietDueUtc = DateTime.MinValue;
                     // status を読めなかった tracker 観測。進捗値は触らず事実だけ残す
-                    if (extra == PetEvent.StructuredObserved) s.SawStructuredTasks = true;
+                    if (extra == PetEvent.StructuredObserved) { s.SawStructuredTasks = true; s.CurrentWork = ""; }
                     ApplyTaskEvent(s, eventType, extra);
                     break;
 
@@ -764,11 +784,25 @@ namespace ClaudePet
                     // tombstone 中の MetadataOnly への Stop も旧 session 由来の遅延とみなす
                     if ((s == null || s.State == Session.MetadataOnly) && IsTombstoned(sessionId)) return;
                     s = Upsert(sessionId, s, project, true);
+                    if (extra == BackgroundWork.Pending)
+                    {
+                        s.State = Session.Working;
+                        s.QuietDueUtc = DateTime.MinValue;
+                        break;
+                    }
                     // root Stop = completion candidate。tracker の状態は一切見ない。
                     // UI は「作業中…」のまま quiet window を待つ。
                     // 同じ session の 2 回目の Stop は最新 Stop から数え直す。
                     s.State = Session.Finalizing;
                     s.QuietDueUtc = DateTime.UtcNow.AddMilliseconds(CompletionQuietMs);
+                    break;
+
+                case PetEvent.StopFailure:
+                    // No success sound. Tombstone rejects late Stop/activity events.
+                    if (s != null) s.Subagents.Reset();
+                    _sessions.Remove(sessionId);
+                    AddTombstone(sessionId);
+                    s = null;
                     break;
 
                 case PetEvent.SessionEnd:
@@ -851,7 +885,7 @@ namespace ClaudePet
                     s.QuietDueUtc = DateTime.MinValue;
                     s.State = Session.Working;
                     // status を読めなかった update_plan 観測。進捗値は触らず事実だけ残す
-                    if (extra == PetEvent.StructuredObserved) s.SawStructuredTasks = true;
+                    if (extra == PetEvent.StructuredObserved) { s.SawStructuredTasks = true; s.CurrentWork = ""; }
                     if (eventType == PetEvent.CodexPlanSnapshot)
                     {
                         // tracker を使った事実は subagent 抑制中でも失わない
@@ -864,8 +898,9 @@ namespace ClaudePet
 
                 case PetEvent.CodexPermission:
                     if (turnId.Length == 0) return;
-                    _recentlyEnded.Remove(key);
+                    if (s == null && IsTombstoned(key)) return;
                     if (s != null && !TurnMatches(s, turnId)) return;
+                    _recentlyEnded.Remove(key);
                     s = Upsert(key, s, project, true);
                     s.IsCodex = true;
                     if (s.TurnId.Length == 0) s.TurnId = turnId;
@@ -900,10 +935,19 @@ namespace ClaudePet
                     if (IsTerminal(s.State)) { Touch(s, project); break; }
                     s.TurnHasSubagent = true;
                     s.Subagents.Apply(eventType == PetEvent.CodexSubagentStart, extra);
+                    s.CurrentWork = "";
                     s.SnapTotal = -1; s.SnapDone = 0; s.SnapInProg = 0; // 表示済み progress も無効化
                     // subagent の出入りも work continuation。candidate を取消す
                     if (s.State == Session.Finalizing) s.State = Session.Working;
                     s.QuietDueUtc = DateTime.MinValue;
+                    break;
+
+                case PetEvent.CodexInterrupt:
+                    if (turnId.Length == 0 || s == null || !TurnMatches(s, turnId)) return;
+                    s.Subagents.Reset();
+                    _sessions.Remove(key);
+                    AddTombstone(key);
+                    s = null;
                     break;
 
                 case PetEvent.CodexSessionEnd:
@@ -1017,13 +1061,15 @@ namespace ClaudePet
 
                 case PetEvent.TaskSnapshot:
                     // extra = "completed/in_progress/total"。TodoWrite の全量スナップショットなので冪等。
-                    string[] nums = extra.Split('/');
+                    s.CurrentWork = ""; // Invalid or legacy snapshot must not leave an obsolete label.
+                    string[] nums = extra.Split('|')[0].Split('/');
                     if (nums.Length != 3) return;
                     int done, inProg, total;
                     if (!int.TryParse(nums[0], out done)) return;
                     if (!int.TryParse(nums[1], out inProg)) return;
                     if (!int.TryParse(nums[2], out total)) return;
                     if (total < 0 || done < 0 || inProg < 0 || done + inProg > total) return;
+                    s.CurrentWork = inProg == 1 ? WorkDetails.Label(extra) : "";
                     s.SnapTotal = total; // total=0 は「リストが空になった」= 進捗表示なし
                     s.SnapDone = done;
                     s.SnapInProg = inProg;
@@ -1161,7 +1207,7 @@ namespace ClaudePet
 
         // ---- 描画 ---------------------------------------------------------
 
-        private void RenderCurrent(bool force)
+        private void RenderCurrent(bool force, bool ensureTopmost = true)
         {
             // 明示 hide 中は描画しない。state 更新だけが続き、Show 時に
             // force 描画でその時点の最新 state に追いつく。
@@ -1169,6 +1215,10 @@ namespace ClaudePet
             string id = ComputeDisplaySession();
             Session s = (id != null) ? _sessions[id] : null;
             int pct = (s != null) ? s.ProgressPercent() : -1;
+            string work = s == null ? "" : s.State == Session.Finalizing ? "終了通知後の待機中" :
+                s.State == Session.Waiting ? "入力・承認待ち" :
+                string.IsNullOrEmpty(s.CurrentWork) ? "" : "工程：" + s.CurrentWork;
+            string elapsed = s != null && IsActive(s.State) ? s.ElapsedText() : "";
 
             // provider + model の 1 行と、他に動いている session 数。
             // どちらも完了判定には一切影響しない表示だけの情報。
@@ -1179,7 +1229,7 @@ namespace ClaudePet
             // 届いた場合も再描画させるため、key に含める。
             string key = (s == null) ? "idle"
                 : id + "|" + s.State + "|" + (s.Project ?? "") + "|" + pct
-                  + "|" + meta + "|" + others + "|" + s.Subagents.Count;
+                  + "|" + meta + "|" + others + "|" + s.Subagents.Count + "|" + work + "|" + elapsed;
             if (!force && key == _shownKey) return; // 同一表示なら再描画しない (PostToolUse連発対策)
             _shownKey = key;
 
@@ -1189,7 +1239,7 @@ namespace ClaudePet
             if (s == null) bmp = PetRenderer.RenderIdle(_winW, _winH, _scale);
             else if (s.State == Session.Celebrating)
                 bmp = PetRenderer.RenderCelebrate(_winW, _winH, _scale, s.Project, meta, others);
-            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct, meta, others);
+            else bmp = PetRenderer.RenderWorking(_winW, _winH, _scale, s.Project, pct, meta, others, work, elapsed);
 
             if (_hud != null) _hud.Dispose();
             _hud = bmp;
@@ -1209,7 +1259,7 @@ namespace ClaudePet
             ArmSpriteTimer();
 
             // 表示内容が実際に変わった時だけ TOPMOST を再保証する (event-driven のみ)
-            EnsureTopmost();
+            if (ensureTopmost) EnsureTopmost();
         }
 
         private void ArmSpriteTimer()
@@ -1227,6 +1277,7 @@ namespace ClaudePet
         private void OnSpriteTick()
         {
             if (!_petVisible) { ArmSpriteTimer(); return; }
+            RenderCurrent(false, false); // Clock text only changes once per second; no TOPMOST polling.
             DrawSpriteFrame();
             ArmSpriteTimer();
         }
@@ -1336,7 +1387,7 @@ namespace ClaudePet
                     // 片付け、遅延イベントで幽霊復活しないよう tombstone を残す。
                     _sessions.Remove(key);
                     AddTombstone(key);
-                    PetDebug("finalize sess=" + key + " -> suppressed (other active)");
+                    PetDebug("finalize suppressed (other active)");
                     continue;
                 }
                 s.State = Session.Celebrating;
@@ -1345,14 +1396,14 @@ namespace ClaudePet
                 s.LastSeq = _seq;
                 s.LastAtUtc = DateTime.UtcNow;
                 celebrated = true;
-                PetDebug("finalize sess=" + key + " -> state=" + s.State);
+                PetDebug("finalize state=" + s.State);
             }
 
             // 音と完了ポーズは実際に完了通知を出すときだけ。明示 hide 中は
             // ユーザーが意図的に Pet を消しているので音も鳴らさない (後で再生もしない)。
             if (celebrated && _petVisible) Native.MessageBeep(Native.SOUND_DEFAULT);
             RenderCurrent(false);
-            PetDebug("finalize-render shown=" + _shownKey);
+            PetDebug("finalize-render has-selection=" + !string.IsNullOrEmpty(_shownKey));
             if (celebrated)
             {
                 if (_petVisible) Native.SetTimer(_hwnd, TimerRevert, RevertDelayMs, IntPtr.Zero);
@@ -1420,7 +1471,7 @@ namespace ClaudePet
                 Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
             }
             EnsureTopmost();
-            PetDebug("show-pet shown=" + _shownKey);
+            PetDebug("show-pet has-selection=" + !string.IsNullOrEmpty(_shownKey));
         }
 
         private void HidePet()
@@ -1604,19 +1655,19 @@ namespace ClaudePet
         // pct>=0 のときだけ依頼全体の推定進捗 (bar + 全体 推定N%) を追加表示する。
         // Waiting も Finalizing (root Stop 後の quiet window) も同じ描画。
         public static Bitmap RenderWorking(int w, int h, float scale, string project, int pct,
-            string meta, int otherActive)
+            string meta, int otherActive, string work = "", string elapsed = "")
         {
             Bitmap bmp = NewCanvas(w, h);
             using (Graphics g = NewGraphics(bmp))
             {
-                DrawStatusPill(g, w, h, scale, "作業中…", TitleNeutral, project, pct, meta, otherActive);
+                DrawStatusPill(g, w, h, scale, "作業中…", TitleNeutral, project, pct, meta, otherActive, work, elapsed);
             }
             return bmp;
         }
 
         // 状態ピル: <title> / [meta + +N] / [progress bar + 全体 推定 N%] / [project]。
         private static void DrawStatusPill(Graphics g, int w, int h, float scale, string title, Color titleColor,
-            string project, int pct, string meta, int otherActive)
+            string project, int pct, string meta, int otherActive, string work, string elapsed)
         {
             Color bg = Color.FromArgb(205, 250, 250, 248);
             Color border = Color.FromArgb(255, 210, 205, 196);
@@ -1632,6 +1683,10 @@ namespace ClaudePet
             float barY = 33f + metaH;
             float pctY = 45f + metaH;
             float cursor = ((pct >= 0) ? 66f : 32f) + metaH; // ヘッダ (+meta+bar+%) の下端
+            float workY = cursor;
+            if (!string.IsNullOrEmpty(work)) cursor += 34f;
+            float elapsedY = cursor;
+            if (!string.IsNullOrEmpty(elapsed)) cursor += 18f;
             float projY = cursor;
             if (hasProject) cursor += 19f;
 
@@ -1682,6 +1737,23 @@ namespace ClaudePet
                     using (var brush = new SolidBrush(textColor))
                         g.DrawString("全体 推定 " + pct + "%", font, brush, w / 2f, by + pctY * scale, fmt);
                 }
+
+                if (!string.IsNullOrEmpty(work))
+                {
+                    using (var labelFormat = new StringFormat(fmt))
+                    using (var font = new Font("Yu Gothic UI", 12f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                    using (var brush = new SolidBrush(textColor))
+                    {
+                        labelFormat.Trimming = StringTrimming.EllipsisCharacter;
+                        labelFormat.FormatFlags = StringFormatFlags.LineLimit;
+                        g.DrawString(work, font, brush, new RectangleF(bx + 10 * scale,
+                            by + workY * scale, bw - 20 * scale, 34 * scale), labelFormat);
+                    }
+                }
+                if (!string.IsNullOrEmpty(elapsed))
+                    using (var font = new Font("Yu Gothic UI", 12f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                    using (var brush = new SolidBrush(subColor))
+                        g.DrawString(elapsed, font, brush, w / 2f, by + elapsedY * scale, fmt);
 
                 if (hasProject)
                 {

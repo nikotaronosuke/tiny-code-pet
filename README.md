@@ -32,7 +32,7 @@ Claude Code と Codex を同時に使っても session / 状態は衝突しま�
 | 状態 | 表示 | 意味 |
 |---|---|---|
 | Idle | 🥷 + `Tiny Code Pet` | 何もしていない。呼吸・瞬きの低速ループ |
-| 作業中 | 🥷 + 「作業中…」(+ 「**全体 推定 N%**」) + project名 | 放置してよい。permission 待ちも、Stop 後の静穏待ちも、すべてこの表示 |
+| 作業中 | 🥷 + 「作業中…」(+ 「**全体 推定 N%**」) + project名 | 工程名と経過時間を併記。入力・承認待ちや終了通知後の待機中は補助行に表示 |
 | 完了 | 🥷 + 「終わったよ！」+ project名 | root Stop の後 20 秒間その作業が再開されなかった (決めポーズを1回再生・通知音1回・約5秒後に Idle) |
 
 **「未完了」表示は無い。** 完了と言い切れない停止は何も出さずに Idle へ戻る。
@@ -80,12 +80,12 @@ Working / Finalizing / Waiting の session だけを数える (0 なら非表示
 
 旧ヒヨコ版の「待機CPUほぼ0 / RAM十数MB」は忍者版の測定値ではありません。
 忍者版は表示中に低FPSの再描画を行います。常駐版のCPU・メモリは実環境での計測が必要です。
-テキストHUDはイベント時だけ再生成し、各フレームではキャラクターを合成します。
+テキストHUDはイベント時と経過秒が変わった時だけ再生成し、それ以外のフレームではキャラクターを合成します。
 TOPMOSTの再保証は状態変更・明示操作時だけで、フレーム更新では行いません。
 
 `./test.ps1` で状態遷移、分身の重複・順序逆転、旧ターン除外、20秒静穏、
 透過、アニメーション、非表示timer停止、描画リソースを検証できます。
-ローカル検証では47項目通過、500フレーム後のGDIオブジェクト増加は0でした。
+ローカル検証では85項目通過、500フレーム後のGDIオブジェクト増加は0でした。
 100% / 125% / 200%スケールのオフスクリーン描画も確認しています。
 実際のClaude/Codexが分身Hookを発火するところまでの結合検証は未実施です。
 Codexデスクトップアプリでは、Hook承認後にアプリ本体と内部プロセスを再起動し、
@@ -118,8 +118,8 @@ Codex Hooks (hooks.json)
         │  stdin の JSON から status metadata のみ読む
         │  (hook_event_name / session_id / turn_id / cwd / tool_name / plan[].status)
         ▼
-CodexPetNotify.exe    … Codex Hook Adapter。dwData 20〜27 へ変換して即終了
-        │  WM_COPYDATA: dwData=20〜27、payload は 4 行
+CodexPetNotify.exe    … Codex Hook Adapter。dwData 20〜28 へ変換して即終了
+        │  WM_COPYDATA: dwData=20〜28、payload は 4 行
         │  (session_id / project名 / extra / turn_id を改行区切り)
         ▼
 ClaudePet.exe         … 同じ常駐ペット。provider + session + turn で状態を分ける
@@ -134,6 +134,46 @@ ClaudePet.exe         … 同じ常駐ペット。provider + session + turn で�
   扱うのは Hook が配る構造化 status metadata のみ
 
 ### 依頼全体の推定進捗
+
+Codexで計画情報が出ない場合は、利用中のバージョンが提供する計画ツールの設定を確認してください。
+Codex 0.152.0以降の有効化設定は、config.tomlのルートで
+`tools.update_plan.enabled = true` です。既存の `[tools.update_plan]` がある場合は
+その中の `enabled = true` を使い、重複定義しないでください。
+Hookインストーラはこの設定を自動変更しません。
+設定保存だけでは進捗の復旧確認になりません。実セッションでツールが提供され、
+2項目以上の計画のPostToolUseがPetまで届く必要があります。
+[公式リリース記録](https://github.com/openai/codex/releases/tag/rust-v0.152.0)
+
+### 現在の工程と経過時間
+
+- 作業中のHUDに、推定進捗率とは別に `工程：表示を検証する` と `経過 05:23` を表示します。
+- Codex update_planのstep、Claude TodoWriteのactiveForm（なければcontent）から、
+  単一のin_progress工程名だけを表示用に読みます。Prompt・応答・コマンド本文は読みません。
+  工程名はメモリ内のみで最大120文字、画面では最大2行・長いものは省略します。
+- 工程名は最後に通知された計画上の現在地であり、実行中のツールや応答の実況ではありません。
+  trackerがない、複数工程が同時進行、ClaudeのTaskCreated/TaskUpdate系で名前が取れない、
+  Codexでsubagentを検知した場合は工程名を推測しません。
+- 新しい依頼で時計と工程名をリセットします。開始Hookを取り逃した場合（Petの途中起動等）は
+  `観測から 00:00` と表示し、依頼開始から測れたようには見せません。
+- 経過時間は表示中だけ既存animation timerで毎秒更新。非表示中は描画せず、再表示で追いつきます。
+  時間経過による進捗の水増し、残り時間予測、稼働・完了判定は行いません。
+- 入力待ちは `入力・承認待ち`、Stop後20秒の静穏待ちは `終了通知後の待機中` と補足します。
+  完了通知が出たら工程と時計は消えます。完了条件・通知音は従来どおりです。
+
+### 終了・中断の補助情報
+
+- Claude Stopの `background_tasks` にmonitor以外の処理中作業があれば、
+  「作業中…」のまま完了候補を保留します。次のroot Stopが必要です。
+- フィールド欠落は従来の20秒方式へfallbackします。空配列との区別を維持し、
+  不正なmetadataを「背景作業なし」とは扱いません。
+- 常設monitorと予約されたsession_cronsは現在turnの完了を妨げません。
+  shellが常設処理かどうかはコマンド本文を読まないため判断できず、保守的に保留します。
+- Claude StopFailure / Codex Interruptは完了候補を取り消して静かに終了します。
+  完了音は鳴らしません。Codexは新しいInterrupt Hookの登録・信頼が必要です。
+- 20秒待機、継続イベントでの候補取消し、進捗と完了の独立は維持します。
+  これは成果物の正しさや、別途予約した作業までの達成保証ではありません。
+
+### 進捗の計算
 
 「依頼 (Request)」= そのセッションで最後に `UserPromptSubmit` が来てから Stop までの1ターン。
 新しい依頼が始まると前回依頼の進捗はリセットされる。
@@ -168,7 +208,7 @@ build 確認 / docs 更新」のように依頼全体を分解したものにな
    重複通知でも二重加算されない (上限 256 件/セッション)。in_progress・削除/キャンセルも反映
 2. **TodoWrite スナップショット**: TodoWrite のセッションでは PostToolUse payload の
    `tool_input` 内の `"status"` 値の件数だけを数えて `completed/in_progress/total` を導出する
-   (タスク本文は読まない・送らない)。全量スナップショットなので重複発火しても冪等
+   (工程名は表示専用で読み、件数には影響させない)。全量スナップショットなので重複発火しても冪等
 
 両方を同一依頼内で観測した場合は TodoWrite スナップショットを優先。
 
@@ -482,7 +522,7 @@ Hookが未発火・未登録の場合、メイン忍者は動くが分身は現�
 
 ログイン時に常駐させたい場合は `shell:startup` に ClaudePet.exe のショートカットを置く (任意)。
 
-デバッグ: `bin\debug.flag` という空ファイルを置くと `bin\debug.log` へイベントが記録される
+デバッグ: `bin\debug.flag` という空ファイルを置くと `bin\status-debug.log` へイベントが記録される
 (通常時は完全に無効)。調査後は flag と log を削除すること。
 
 ## Uninstallation
