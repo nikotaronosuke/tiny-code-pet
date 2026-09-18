@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 
-> A tiny native Windows desktop pet for Claude Code and Codex.
+> Claude Code と Codex のための、小さな Windows ネイティブのデスクトップ Pet。
 
 Claude Code / Codex の作業状況・依頼全体の推定進捗・作業終了を、
 画面右下の小さな忍者で確認できる **Windows ネイティブのデスクトップ Pet** です。
@@ -92,7 +92,7 @@ Codexデスクトップアプリでは、Hook承認後にアプリ本体と内�
 実際の会話に連動した「作業中…」とprovider/model表示を確認しています。
 この確認は、実セッションの分身Hookや完了音までの結合検証を意味しません。
 
-## How it works
+## しくみ
 
 ```
 Claude Code hooks (user-level settings.json / 全て async・fire-and-forget)
@@ -331,7 +331,7 @@ tray の追加に失敗しても Pet 本体は通常動作する (fail-soft)。
 Claude Code と同じペット・同じ UI で Codex の状態も見られる。
 Codex 専用の画面は追加していない (作業中… / 終わったよ！をそのまま使う)。
 
-### Setup
+### 設定
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
@@ -405,7 +405,7 @@ async はあくまで性能最適化であり、sync になっても正しさは
   内部状態は provider + session + **turn** で分けている。
   現在 turn 以外の遅延イベントは UI へ反映しない。
 
-### Known limitation: subagent
+### 既知の制限: subagent
 
 - `SubagentStart` / `SubagentStop` は公式 schema にはあるが、
   **検証環境で実発火を確認できていない** (現 build で発火しない可能性がある)。
@@ -417,7 +417,7 @@ async はあくまで性能最適化であり、sync になっても正しさは
   work continuation として completion candidate の取消には使う。
 - subagent の進捗のためだけに rollout watcher / App Server 常駐は導入しない。
 
-## Privacy / Security
+## プライバシーと安全性
 
 このツールが扱うのは status metadata のみ:
 
@@ -429,7 +429,7 @@ async はあくまで性能最適化であり、sync になっても正しさは
   Codex の plan step 本文、tool command / response 本文、transcript も読まない
 - 保存も送信もしない (ネットワーク通信なし・履歴 DB なし・全て in-memory)
 
-## Requirements
+## 動作条件
 
 - Windows 10 / 11 (x64)
 - .NET Framework 4.8 (Windows 10/11 に標準搭載。追加インストール不要)
@@ -438,12 +438,12 @@ async はあくまで性能最適化であり、sync になっても正しさは
 - (任意) Codex — Hooks 対応バージョン。VS Code 拡張 26.814.41407 /
   Codex CLI 0.148.0-alpha.15 で仕様を実測して実装
 
-## Installation
+## 導入
 
 Claude Code だけ / Codex だけ / 両方、どの構成でも使えます。
 使いたい方の hook だけを入れてください。
 
-### Option 1: Download release (おすすめ)
+### 方法 1: リリースをダウンロードする(おすすめ)
 
 1. [Releases](https://github.com/nikotaronosuke/tiny-code-pet/releases) から
    `Tiny-Code-Pet-v1.0.0-windows.zip` をダウンロードして展開
@@ -456,9 +456,9 @@ pwsh -File install-codex-hook.ps1   # Codex 用 (先に -DryRun で差分確認�
 ```
 
 配布 binary は署名していないため、初回実行時に Windows SmartScreen が
-警告を出すことがあります。気になる場合は Option 2 でソースからビルドしてください。
+警告を出すことがあります。気になる場合は方法 2 でソースからビルドしてください。
 
-### Option 2: Build from source
+### 方法 2: ソースからビルドする
 
 ```powershell
 git clone https://github.com/nikotaronosuke/tiny-code-pet.git
@@ -471,7 +471,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 コンパイルには Windows 標準の `csc.exe` (.NET Framework 4.8 同梱) を使うため、
 Visual Studio や .NET SDK は不要です。
 
-その後 Option 1 と同じ install script を実行してください。
+その後、方法 1 と同じ install script を実行してください。
 Codex 側の詳細は「Codex 対応 › Setup」を参照 (`install-codex-hook.ps1`)。
 
 > **Note**
@@ -525,7 +525,7 @@ Hookが未発火・未登録の場合、メイン忍者は動くが分身は現�
 デバッグ: `bin\debug.flag` という空ファイルを置くと `bin\status-debug.log` へイベントが記録される
 (通常時は完全に無効)。調査後は flag と log を削除すること。
 
-## Uninstallation
+## 削除する
 
 1. Hook を外す: `pwsh -File uninstall-hook.ps1`
    (`ClaudePetNotify` を含む hook だけを全イベントから削除。他の設定は無傷。自動バックアップあり)
@@ -540,7 +540,7 @@ Hook を完全に元へ戻すには、自動作成されたバックアップを
 Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$env:USERPROFILE\.claude\settings.json" -Force
 ```
 
-## Limitations
+## 制限
 
 - 進捗はあくまで heuristic。Claude がタスクリストを整理し直すと数字が前後する
 - **完了通知は「作業が止まった」ことの通知であって、成果物の正しさの保証ではない**
@@ -574,23 +574,23 @@ Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$e
   (誤った完了通知を出さないための意図的な振る舞い)
 - Codex 側に nested 抑制 (Claude の process ancestor chain 相当) はない
 
-### Technical note: Task 粒度と進捗の滑らかさ
+### 技術メモ: Task 粒度と進捗の滑らかさ
 
 進捗の刻みは Claude が作る Task の数に依存する。実験では「6〜8個のマイルストーン Task を
 維持せよ」という指示をプロンプトに付けると進捗が最大7ポイント刻みまで滑らかになったが、
 turn 数・実行時間・コストが大きく増えるためツール側では強制していない。
 滑らかな進捗が欲しい長時間依頼では、同様の指示を自分のプロンプトに付けることで opt-in できる。
 
-## Development status
+## 開発状況
 
 Claude Code の状態を手元で確認したくて作った個人用の小さなツールです。
 現在は明示依頼に基づき、忍者アニメーションとサブエージェント分身を追加しています。
 新しい状態判定・診断画面・Verified等は今回の対象外です。
 
-## AI-assisted development
+## AI を使った開発
 
-This project was developed with AI assistance, including ChatGPT and Claude Code.
+このプロジェクトは ChatGPT や Claude Code などの AI を使いながら開発しました。
 
-## License
+## ライセンス
 
 [MIT](LICENSE)
