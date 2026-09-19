@@ -28,9 +28,6 @@ Claude Code and Codex can be monitored at the same time without their session st
 | 🔒 **Privacy boundary** | Does not read prompt text, assistant responses, source code, tool command bodies, or transcripts |
 | 🥷 **Ninja + shadow clones** | Idle / working / completed animation plus up to six visible subagents |
 
-> **Why is it designed this way?** Read the [Owner Decision Log](docs/OWNER_DECISIONS.en.md).  
-> It records rejected approaches, measured trade-offs, and why completion semantics changed several times.
-
 ## Visible states
 
 The UI intentionally exposes only three primary states:
@@ -346,11 +343,7 @@ A few notable rejected approaches:
 - Electron / WebView was not introduced when the chick UI was replaced by animated ninja sprites.
 - Codex was added through a separate adapter rather than rewriting Claude semantics to match Codex.
 
-For the full reasoning and evidence links, read:
-
-- [Owner Decision Log](docs/OWNER_DECISIONS.en.md)
-- [Original Japanese Owner Decision Log](docs/OWNER_DECISIONS.md)
-- [Detailed technical decision history](docs/DESIGN_DECISIONS.md) *(Japanese)*
+The chronological design record is [docs/DESIGN_DECISIONS.md](docs/DESIGN_DECISIONS.md) *(Japanese)*. It was written alongside development and records accepted, rejected, and measured approaches; current behavior is defined by the README and source.
 
 ## Development status
 
