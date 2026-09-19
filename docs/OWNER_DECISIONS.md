@@ -184,7 +184,7 @@ Codexでは Stop 後に同じ turn で作業が継続し得ることを確認し
 さらに interrupt 後に約18.6秒遅れて PostToolUse が届くケースも観測したため、
 短い grace ではなく20秒静穏へ統一しました。
 
-**Evidence:** [20s quiet-window completion](https://github.com/nikotaronosuke/tiny-code-pet/commit/c4b5a95)
+**Evidence:** [20s quiet-window completion](https://github.com/nikotaronosuke/tiny-code-pet/commit/c4b5a95) / [Codex delayed-event measurement](https://github.com/nikotaronosuke/tiny-code-pet/commit/c01126d)
 
 ---
 
