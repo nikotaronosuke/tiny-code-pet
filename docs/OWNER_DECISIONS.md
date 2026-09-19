@@ -1,5 +1,7 @@
 # Owner Decision Log
 
+日本語 | [English](OWNER_DECISIONS.en.md)
+
 Tiny Code Pet は、AI にコードを書かせて一度で完成したものではありません。
 
 実際に使いながら、**誤通知・重さ・プライバシー・表示の分かりにくさ**を見て仕様を何度も変更しています。

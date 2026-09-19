@@ -1,5 +1,7 @@
 # Tiny Code Pet 🥷
 
+[English](README.en.md) | 日本語
+
 [![Build](https://github.com/nikotaronosuke/tiny-code-pet/actions/workflows/build.yml/badge.svg)](https://github.com/nikotaronosuke/tiny-code-pet/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
