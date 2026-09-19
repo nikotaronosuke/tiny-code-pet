@@ -180,9 +180,9 @@ trackerは **進捗表示だけ** に使います。
 これは「成果物が正しい」の保証ではなく、
 Petが本文を読まずに観測できる範囲での「作業が止まった」という意味です。
 
-Codexでは、Stop後に約1.88秒で作業継続したケースや、
-interrupt後に約18.6秒遅れて PostToolUse が届くケースも観測したため、
-短いgraceではなく20秒静穏へ統一しました。
+Codexでは Stop 後に同じ turn で作業が継続し得ることを確認し、
+さらに interrupt 後に約18.6秒遅れて PostToolUse が届くケースも観測したため、
+短い grace ではなく20秒静穏へ統一しました。
 
 **Evidence:** [20s quiet-window completion](https://github.com/nikotaronosuke/tiny-code-pet/commit/c4b5a95)
 
