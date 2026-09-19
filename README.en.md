@@ -355,8 +355,6 @@ It is still intentionally small: no account system, no database, no hosted backe
 
 This project was developed with assistance from tools such as ChatGPT and Claude Code.
 
-Product direction, UX decisions, trade-offs, real-device / real-session verification, and final acceptance decisions are made by the project owner.
-
 ## License
 
 [MIT](LICENSE)
