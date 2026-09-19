@@ -61,6 +61,117 @@ Working / Finalizing / Waiting の session だけを数える (0 なら非表示
 - Subagent 完了の誤通知防止
 - **Codex 対応** (別 adapter / provider + session + turn で状態分離)
 
+## 動作条件
+
+- Windows 10 / 11 (x64)
+- .NET Framework 4.8 (Windows 10/11 に標準搭載。追加インストール不要)
+- [Claude Code](https://claude.com/claude-code) (Hooks 対応バージョン。CLI / VS Code は
+  v2.1.233、Claude Code Desktop はアプリ 1.37937 + エンジン v2.1.246 で開発・検証)
+- (任意) Codex — Hooks 対応バージョン。VS Code 拡張 26.814.41407 /
+  Codex CLI 0.148.0-alpha.15 で仕様を実測して実装
+
+## 導入
+
+Claude Code だけ / Codex だけ / 両方、どの構成でも使えます。
+使いたい方の hook だけを入れてください。
+
+### 方法 1: リリースをダウンロードする(おすすめ)
+
+1. [Releases](https://github.com/nikotaronosuke/tiny-code-pet/releases) から
+   `Tiny-Code-Pet-v1.0.0-windows.zip` をダウンロードして展開
+2. hook を登録する
+
+```powershell
+pwsh -File install-hook.ps1         # Claude Code 用
+pwsh -File install-codex-hook.ps1   # Codex 用 (先に -DryRun で差分確認を推奨)
+.\bin\ClaudePet.exe                 # 常駐開始 (Hook 発火時に自動起動もされる)
+```
+
+配布 binary は署名していないため、初回実行時に Windows SmartScreen が
+警告を出すことがあります。気になる場合は方法 2 でソースからビルドしてください。
+
+### 方法 2: ソースからビルドする
+
+```powershell
+git clone https://github.com/nikotaronosuke/tiny-code-pet.git
+cd tiny-code-pet
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+`bin\ClaudePet.exe` (常駐本体)、`bin\ClaudePetNotify.exe` (Claude Hook ヘルパー)、
+`bin\CodexPetNotify.exe` (Codex Hook ヘルパー) が生成されます。
+コンパイルには Windows 標準の `csc.exe` (.NET Framework 4.8 同梱) を使うため、
+Visual Studio や .NET SDK は不要です。
+
+その後、方法 1 と同じ install script を実行してください。
+Codex 側の詳細は「Codex 対応 › Setup」を参照 (`install-codex-hook.ps1`)。
+
+> **Note**
+> 公開上の製品名は **Tiny Code Pet** ですが、binary 名は既存の hook 設定・
+> install script との互換性のため `ClaudePet.exe` / `ClaudePetNotify.exe` /
+> `CodexPetNotify.exe` のままです (rename 漏れではありません)。
+> WndClass 名・mutex 名・WM_COPYDATA プロトコルも同じ理由で変更していません。
+Claude 側と Codex 側は独立していて、片方だけ入れても動く。
+
+`install-hook.ps1` はユーザーレベル設定 `%USERPROFILE%\.claude\settings.json` に
+以下の hook を **追記** する (既存 hooks は一切変更しない。イベント単位で冪等。
+実行前に `settings.json.backup-claudepet-<日時>` を自動作成)。
+
+| イベント | matcher | 用途 |
+|---|---|---|
+| `Stop` | なし | 完了通知 |
+| `UserPromptSubmit` | なし | Working 開始 / 依頼リセット |
+| `Notification` | `permission_prompt` | 受信のみ (確認 UI は出さない) |
+| `PostToolUse` | `*` | Waiting 解除・Task/Todo 進捗・completion candidate 取消 |
+| `SessionStart` | なし | model 表示用 metadata (これだけでは作業中にしない) |
+| `SessionEnd` | なし | セッション後片付け |
+| `SubagentStart` / `SubagentStop` | `*` | 分身の出入り (親の完了にはしない) |
+| `TaskCreated` | なし | Task 進捗 |
+| `TaskCompleted` | なし | Task 進捗 |
+
+各エントリは `{"type":"command","command":"<clone先>/bin/ClaudePetNotify.exe","timeout":10,"async":true}`。
+`async: true` + 常時 exit 0 のため **Claude Code を一切ブロック・減速させない**。
+
+- ユーザーレベル設定なので全プロジェクトで有効
+- Hook は Claude Code セッション開始時に読み込まれるため、**設定後は新しいセッションから有効**
+
+### 忍者版への更新
+
+`build.ps1` は通常 `bin` に出力する。動作中の旧exeを上書きする前にそのPetを終了する。
+並行してビルドだけ試す場合は `./build.ps1 -OutputDirectory bin/ninja-preview` を使う。
+Claude側の分身には `install-hook.ps1` の再実行による2イベントの追加が必要。
+ユーザーレベル設定への変更なので、AIは承認なしに実行しない。
+Codex側は既存のSubagentStart/Stop登録を使用し、adapterを更新する。
+Hookが未発火・未登録の場合、メイン忍者は動くが分身は現れない。
+
+### 操作
+
+```powershell
+.\bin\ClaudePet.exe                        # 常駐開始 (二重起動は自動防止)
+.\bin\ClaudePetNotify.exe --test myproj    # 完了通知の手動テスト
+.\bin\ClaudePetNotify.exe --quit           # 常駐ペットを終了
+```
+
+ログイン時に常駐させたい場合は `shell:startup` に ClaudePet.exe のショートカットを置く (任意)。
+
+デバッグ: `bin\debug.flag` という空ファイルを置くと `bin\status-debug.log` へイベントが記録される
+(通常時は完全に無効)。調査後は flag と log を削除すること。
+
+## 削除する
+
+1. Hook を外す: `pwsh -File uninstall-hook.ps1`
+   (`ClaudePetNotify` を含む hook だけを全イベントから削除。他の設定は無傷。自動バックアップあり)
+   Codex を入れていた場合は `pwsh -File uninstall-codex-hook.ps1`
+   (`CodexPetNotify` を含む hook だけを削除。`-DryRun` で事前確認可。config.toml は無傷)
+2. 常駐を止める: `.\bin\ClaudePetNotify.exe --quit`
+3. クローンしたフォルダを削除
+
+Hook を完全に元へ戻すには、自動作成されたバックアップを上書きコピーする:
+
+```powershell
+Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$env:USERPROFILE\.claude\settings.json" -Force
+```
+
 ## 忍者アニメーションと分身
 
 - メイン: 待機は約4秒静止して短く瞬き・ごく小さな呼吸。作業は200ms間隔で手元だけ動かす。
@@ -430,117 +541,6 @@ async はあくまで性能最適化であり、sync になっても正しさは
   進捗判定のために収集しない**。タスク本文 (subject/description)、
   Codex の plan step 本文、tool command / response 本文、transcript も読まない
 - 保存も送信もしない (ネットワーク通信なし・履歴 DB なし・全て in-memory)
-
-## 動作条件
-
-- Windows 10 / 11 (x64)
-- .NET Framework 4.8 (Windows 10/11 に標準搭載。追加インストール不要)
-- [Claude Code](https://claude.com/claude-code) (Hooks 対応バージョン。CLI / VS Code は
-  v2.1.233、Claude Code Desktop はアプリ 1.37937 + エンジン v2.1.246 で開発・検証)
-- (任意) Codex — Hooks 対応バージョン。VS Code 拡張 26.814.41407 /
-  Codex CLI 0.148.0-alpha.15 で仕様を実測して実装
-
-## 導入
-
-Claude Code だけ / Codex だけ / 両方、どの構成でも使えます。
-使いたい方の hook だけを入れてください。
-
-### 方法 1: リリースをダウンロードする(おすすめ)
-
-1. [Releases](https://github.com/nikotaronosuke/tiny-code-pet/releases) から
-   `Tiny-Code-Pet-v1.0.0-windows.zip` をダウンロードして展開
-2. hook を登録する
-
-```powershell
-pwsh -File install-hook.ps1         # Claude Code 用
-pwsh -File install-codex-hook.ps1   # Codex 用 (先に -DryRun で差分確認を推奨)
-.\bin\ClaudePet.exe                 # 常駐開始 (Hook 発火時に自動起動もされる)
-```
-
-配布 binary は署名していないため、初回実行時に Windows SmartScreen が
-警告を出すことがあります。気になる場合は方法 2 でソースからビルドしてください。
-
-### 方法 2: ソースからビルドする
-
-```powershell
-git clone https://github.com/nikotaronosuke/tiny-code-pet.git
-cd tiny-code-pet
-powershell -ExecutionPolicy Bypass -File build.ps1
-```
-
-`bin\ClaudePet.exe` (常駐本体)、`bin\ClaudePetNotify.exe` (Claude Hook ヘルパー)、
-`bin\CodexPetNotify.exe` (Codex Hook ヘルパー) が生成されます。
-コンパイルには Windows 標準の `csc.exe` (.NET Framework 4.8 同梱) を使うため、
-Visual Studio や .NET SDK は不要です。
-
-その後、方法 1 と同じ install script を実行してください。
-Codex 側の詳細は「Codex 対応 › Setup」を参照 (`install-codex-hook.ps1`)。
-
-> **Note**
-> 公開上の製品名は **Tiny Code Pet** ですが、binary 名は既存の hook 設定・
-> install script との互換性のため `ClaudePet.exe` / `ClaudePetNotify.exe` /
-> `CodexPetNotify.exe` のままです (rename 漏れではありません)。
-> WndClass 名・mutex 名・WM_COPYDATA プロトコルも同じ理由で変更していません。
-Claude 側と Codex 側は独立していて、片方だけ入れても動く。
-
-`install-hook.ps1` はユーザーレベル設定 `%USERPROFILE%\.claude\settings.json` に
-以下の hook を **追記** する (既存 hooks は一切変更しない。イベント単位で冪等。
-実行前に `settings.json.backup-claudepet-<日時>` を自動作成)。
-
-| イベント | matcher | 用途 |
-|---|---|---|
-| `Stop` | なし | 完了通知 |
-| `UserPromptSubmit` | なし | Working 開始 / 依頼リセット |
-| `Notification` | `permission_prompt` | 受信のみ (確認 UI は出さない) |
-| `PostToolUse` | `*` | Waiting 解除・Task/Todo 進捗・completion candidate 取消 |
-| `SessionStart` | なし | model 表示用 metadata (これだけでは作業中にしない) |
-| `SessionEnd` | なし | セッション後片付け |
-| `SubagentStart` / `SubagentStop` | `*` | 分身の出入り (親の完了にはしない) |
-| `TaskCreated` | なし | Task 進捗 |
-| `TaskCompleted` | なし | Task 進捗 |
-
-各エントリは `{"type":"command","command":"<clone先>/bin/ClaudePetNotify.exe","timeout":10,"async":true}`。
-`async: true` + 常時 exit 0 のため **Claude Code を一切ブロック・減速させない**。
-
-- ユーザーレベル設定なので全プロジェクトで有効
-- Hook は Claude Code セッション開始時に読み込まれるため、**設定後は新しいセッションから有効**
-
-### 忍者版への更新
-
-`build.ps1` は通常 `bin` に出力する。動作中の旧exeを上書きする前にそのPetを終了する。
-並行してビルドだけ試す場合は `./build.ps1 -OutputDirectory bin/ninja-preview` を使う。
-Claude側の分身には `install-hook.ps1` の再実行による2イベントの追加が必要。
-ユーザーレベル設定への変更なので、AIは承認なしに実行しない。
-Codex側は既存のSubagentStart/Stop登録を使用し、adapterを更新する。
-Hookが未発火・未登録の場合、メイン忍者は動くが分身は現れない。
-
-### 操作
-
-```powershell
-.\bin\ClaudePet.exe                        # 常駐開始 (二重起動は自動防止)
-.\bin\ClaudePetNotify.exe --test myproj    # 完了通知の手動テスト
-.\bin\ClaudePetNotify.exe --quit           # 常駐ペットを終了
-```
-
-ログイン時に常駐させたい場合は `shell:startup` に ClaudePet.exe のショートカットを置く (任意)。
-
-デバッグ: `bin\debug.flag` という空ファイルを置くと `bin\status-debug.log` へイベントが記録される
-(通常時は完全に無効)。調査後は flag と log を削除すること。
-
-## 削除する
-
-1. Hook を外す: `pwsh -File uninstall-hook.ps1`
-   (`ClaudePetNotify` を含む hook だけを全イベントから削除。他の設定は無傷。自動バックアップあり)
-   Codex を入れていた場合は `pwsh -File uninstall-codex-hook.ps1`
-   (`CodexPetNotify` を含む hook だけを削除。`-DryRun` で事前確認可。config.toml は無傷)
-2. 常駐を止める: `.\bin\ClaudePetNotify.exe --quit`
-3. クローンしたフォルダを削除
-
-Hook を完全に元へ戻すには、自動作成されたバックアップを上書きコピーする:
-
-```powershell
-Copy-Item "$env:USERPROFILE\.claude\settings.json.backup-claudepet-<日時>" "$env:USERPROFILE\.claude\settings.json" -Force
-```
 
 ## 制限
 
