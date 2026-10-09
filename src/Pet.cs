@@ -78,6 +78,17 @@ namespace ClaudePet
         public const int WM_CONTEXTMENU = 0x007B;
         public const int WM_LBUTTONUP = 0x0202;
         public const int WM_RBUTTONUP = 0x0205;
+        public const int WM_NCHITTEST = 0x0084;
+        public const int WM_MOUSEACTIVATE = 0x0021;
+        public const int WM_SETCURSOR = 0x0020;
+        public const int WM_MOVING = 0x0216;
+        public const int WM_MOVE = 0x0003;
+        public const int WM_EXITSIZEMOVE = 0x0232;
+        public const int WM_DISPLAYCHANGE = 0x007E;
+        public const int WM_SETTINGCHANGE = 0x001A;
+        public const int HTCAPTION = 2;
+        public const int MA_NOACTIVATE = 3;
+        public const int GWL_EXSTYLE = -20;
 
         public const int SW_HIDE = 0;
         public const int SW_SHOWNOACTIVATE = 4;
@@ -90,6 +101,7 @@ namespace ClaudePet
         public const int SWP_NOZORDER = 0x0004;
         public const int SWP_NOACTIVATE = 0x0010;
         public const int SWP_SHOWWINDOW = 0x0040;
+        public const int SWP_FRAMECHANGED = 0x0020;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
 
         // ---- 通知領域 (Shell_NotifyIcon) ----
@@ -103,7 +115,10 @@ namespace ClaudePet
         public const uint MF_STRING = 0x0;
         public const uint MF_GRAYED = 0x1;
         public const uint MF_SEPARATOR = 0x800;
+        public const uint MF_CHECKED = 0x8;
         public const uint TPM_RIGHTBUTTON = 0x2;
+        public const uint TPM_NONOTIFY = 0x80;
+        public const uint TPM_RETURNCMD = 0x100;
 
         public const uint SOUND_DEFAULT = 0x00000000;      // 完了音 (既定のビープ)。完了時だけ鳴らす
 
@@ -217,6 +232,24 @@ namespace ClaudePet
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
 
+        // Window styles are 32-bit values even in a 64-bit process.
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        public static extern int GetWindowLong(IntPtr hWnd, int index);
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+        public static extern int SetWindowLong(IntPtr hWnd, int index, int value);
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")]
+        public static extern IntPtr MonitorFromRect(ref RECT rect, uint flags);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MONITORINFO { public int cbSize; public RECT monitor, work; public uint flags; }
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+        [DllImport("user32.dll")]
+        public static extern IntPtr LoadCursor(IntPtr instance, IntPtr name);
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetCursor(IntPtr cursor);
+
         [DllImport("user32.dll")]
         public static extern IntPtr SetTimer(IntPtr hWnd, IntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
 
@@ -243,7 +276,7 @@ namespace ClaudePet
         public static extern bool AppendMenu(IntPtr hMenu, uint uFlags, uint uIDNewItem, string lpNewItem);
 
         [DllImport("user32.dll")]
-        public static extern bool TrackPopupMenuEx(IntPtr hMenu, uint uFlags, int x, int y, IntPtr hWnd, IntPtr lptpm);
+        public static extern uint TrackPopupMenuEx(IntPtr hMenu, uint uFlags, int x, int y, IntPtr hWnd, IntPtr lptpm);
 
         [DllImport("user32.dll")]
         public static extern bool DestroyMenu(IntPtr hMenu);
@@ -532,6 +565,29 @@ namespace ClaudePet
         private bool _sawClaudeHook;
         private const int CmdClaudeDiagnostics = 1005;
         private const int CmdExitPet = 1004;      // tray menu: ClaudePetを終了
+        private const int CmdAutoDisplay = 1006;
+        private const int CmdMovePet = 1007;
+        private const int CmdResetPosition = 1008;
+        private const int CmdCompletionSound = 1009;
+        private bool _moveMode;
+        private bool _completionSound = true;
+        private const int CmdWorkFirst = 2000;    // MaxSessions entries; no session IDs in menu commands
+
+        // A choice belongs to one observed request, not a reusable session ID.
+        // Revalidate it after the native menu's nested message loop receives hooks.
+        private sealed class DisplayChoice
+        {
+            public readonly string Key;
+            public readonly Session Session;
+            public readonly long RequestGen;
+            public DisplayChoice(string key, Session session)
+            {
+                Key = key; Session = session; RequestGen = session.RequestGen;
+            }
+        }
+        private readonly List<DisplayChoice> _workMenuChoices = new List<DisplayChoice>();
+        private DisplayChoice _pinnedWork;
+        private bool _trayMenuOpen;
 
         private IntPtr _hwnd;
         private Native.WndProcDelegate _wndProc; // GC防止のためフィールドで保持
@@ -645,6 +701,43 @@ namespace ClaudePet
         {
             switch (msg)
             {
+                case Native.WM_NCHITTEST:
+                    if (_moveMode) return new IntPtr(Native.HTCAPTION);
+                    break;
+                case Native.WM_MOUSEACTIVATE:
+                    return new IntPtr(Native.MA_NOACTIVATE);
+                case Native.WM_SETCURSOR:
+                    if (_moveMode)
+                    {
+                        Native.SetCursor(Native.LoadCursor(IntPtr.Zero, new IntPtr(32646))); // IDC_SIZEALL
+                        return new IntPtr(1);
+                    }
+                    break;
+                case Native.WM_MOVING:
+                    if (_moveMode && lParam != IntPtr.Zero)
+                    {
+                        Native.RECT moving = (Native.RECT)Marshal.PtrToStructure(lParam, typeof(Native.RECT));
+                        _baseX = moving.left; _baseY = moving.top;
+                        return new IntPtr(1);
+                    }
+                    break;
+                case Native.WM_MOVE:
+                    if (_moveMode) RememberWindowPosition(hWnd);
+                    break;
+                case Native.WM_EXITSIZEMOVE:
+                    if (_moveMode)
+                    {
+                        // Read the final native position too: Esc may have restored the drag origin.
+                        RememberWindowPosition(hWnd);
+                        SetMoveMode(false);
+                        KeepOnScreen();
+                    }
+                    return IntPtr.Zero;
+                case Native.WM_DISPLAYCHANGE:
+                case Native.WM_SETTINGCHANGE:
+                    if (_hwnd != IntPtr.Zero) KeepOnScreen();
+                    break;
+
                 case Native.WM_COPYDATA:
                     HandleCopyData(lParam);
                     return new IntPtr(1);
@@ -660,7 +753,7 @@ namespace ClaudePet
                     return IntPtr.Zero;
 
                 case Native.WM_COMMAND:
-                    // tray context menu の選択 (TrackPopupMenuEx が owner へ post する)
+                    // tray commands (explicit WM_COMMAND also uses the same dispatch)
                     OnTrayCommand(unchecked((int)wParam.ToInt64()) & 0xFFFF);
                     return IntPtr.Zero;
 
@@ -1191,11 +1284,27 @@ namespace ClaudePet
             }
         }
 
+        private bool IsCurrentChoice(DisplayChoice choice)
+        {
+            Session current;
+            return choice != null && _sessions.TryGetValue(choice.Key, out current) &&
+                object.ReferenceEquals(current, choice.Session) &&
+                current.RequestGen == choice.RequestGen && IsActive(current.State);
+        }
+
+        private string PinnedSession()
+        {
+            if (!IsCurrentChoice(_pinnedWork)) _pinnedWork = null;
+            return _pinnedWork == null ? null : _pinnedWork.Key;
+        }
+
         // 表示priority: active (Working/Finalizing/Waiting) > 完了通知 (Celebrating)。
         // 同率は最新イベントの session。該当なし = null で呼び出し側は Idle を描く。
         // 過去の完了通知が進行中の作業を隠さないことを優先する。
         private string ComputeDisplaySession()
         {
+            string pinned = PinnedSession();
+            if (pinned != null) return pinned; // Active work only; completion priority stays unchanged.
             string bestId = null;
             int bestRank = 0;
             long bestSeq = -1;
@@ -1288,7 +1397,8 @@ namespace ClaudePet
             if (_hud != null) _hud.Dispose();
             _hud = bmp;
             long now = _clock.ElapsedMilliseconds;
-            _sprite.Select(s == null ? 0 : s.State == Session.Celebrating ? 2 : 1, now);
+            _sprite.Select(s == null ? 0 : s.State == Session.Celebrating ? 2 :
+                s.State == Session.Waiting ? 3 : 1, now);
             int count = s == null || !IsActive(s.State) ? 0 : s.Subagents.Count;
             if (_cloneCount != count)
             {
@@ -1299,6 +1409,7 @@ namespace ClaudePet
             // Root/session cleanup clears clones immediately; only child lifecycle
             // events within active work animate their arrival/departure.
             if (s == null || !IsActive(s.State)) _oldCloneCount = 0;
+            if (!_moveMode) KeepOnScreen();
             DrawSpriteFrame();
             ArmSpriteTimer();
 
@@ -1311,7 +1422,7 @@ namespace ClaudePet
             long now = _clock.ElapsedMilliseconds;
             bool transition = now - _clonesChanged < 500 && _oldCloneCount != _cloneCount;
             int interval = !_petVisible || (!_sprite.NeedsTick(now) && !transition) ? 0 :
-                transition ? 50 : _sprite.NextTickMs(now);
+                transition ? 50 : _sprite.NextTickMs(now, _cloneCount > 0);
             if (interval == _spriteInterval) return;
             Native.KillTimer(_hwnd, TimerSprite);
             _spriteInterval = interval;
@@ -1445,7 +1556,7 @@ namespace ClaudePet
 
             // 音と完了ポーズは実際に完了通知を出すときだけ。明示 hide 中は
             // ユーザーが意図的に Pet を消しているので音も鳴らさない (後で再生もしない)。
-            if (celebrated && _petVisible) Native.MessageBeep(Native.SOUND_DEFAULT);
+            if (ShouldPlayCompletionSound(celebrated)) Native.MessageBeep(Native.SOUND_DEFAULT);
             RenderCurrent(false);
             PetDebug("finalize-render has-selection=" + !string.IsNullOrEmpty(_shownKey));
             if (celebrated)
@@ -1488,6 +1599,82 @@ namespace ClaudePet
 
         // ---- Z-order / 表示制御 --------------------------------------------
 
+        private bool ShouldPlayCompletionSound(bool celebrated)
+        {
+            return celebrated && _petVisible && _completionSound;
+        }
+
+        private void SetMoveMode(bool enabled)
+        {
+            if (_hwnd == IntPtr.Zero) return;
+            int style = Native.GetWindowLong(_hwnd, Native.GWL_EXSTYLE);
+            int next = enabled ? style & ~Native.WS_EX_TRANSPARENT : style | Native.WS_EX_TRANSPARENT;
+            Native.SetWindowLong(_hwnd, Native.GWL_EXSTYLE, next);
+            _moveMode = (Native.GetWindowLong(_hwnd, Native.GWL_EXSTYLE) & Native.WS_EX_TRANSPARENT) == 0;
+            Native.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE |
+                Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_FRAMECHANGED);
+        }
+
+        private void RememberWindowPosition(IntPtr window)
+        {
+            Native.RECT rect;
+            if (Native.GetWindowRect(window, out rect)) { _baseX = rect.left; _baseY = rect.top; }
+        }
+
+        internal static Point FitPosition(int x, int y, Rectangle visible, Native.RECT screen)
+        {
+            // Transparent canvas margins may extend beyond the display.
+            return new Point(Math.Max(screen.left - visible.Left, Math.Min(x, screen.right - visible.Right)),
+                Math.Max(screen.top - visible.Top, Math.Min(y, screen.bottom - visible.Bottom)));
+        }
+
+        private Rectangle PlacementBounds()
+        {
+            if (_hud == null) return new Rectangle(0, 0, _winW, _winH);
+            Rectangle visible;
+            using (Bitmap frame = ComposeSpriteFrame()) visible = SpriteAnimator.MeasureVisibleBounds(frame);
+            visible = Rectangle.Union(visible, _sprite.Bounds(
+                new Rectangle((_winW-S(96))/2, _winH-S(152), S(96), S(96)), 0));
+            bool transition = _clock.ElapsedMilliseconds - _clonesChanged < 500 && _oldCloneCount != _cloneCount;
+            int count = Math.Min(6, Math.Max(_cloneCount, transition ? _oldCloneCount : 0));
+            for (int i = 0; i < count; i++)
+            {
+                var cell = new Rectangle(S(10+i*36), _winH-S(50), S(40), S(40));
+                visible = Rectangle.Union(visible, _sprite.Bounds(cell, i+1));
+                if (transition) // Reserve the short smoke/arrival animation too.
+                    visible = Rectangle.Union(visible, new Rectangle(cell.X-S(4), cell.Y, S(48), S(40)));
+            }
+            return visible;
+        }
+
+        private void MovePetTo(int x, int y)
+        {
+            _baseX = x; _baseY = y;
+            Native.SetWindowPos(_hwnd, IntPtr.Zero, x, y, 0, 0,
+                Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+        }
+
+        private void KeepOnScreen()
+        {
+            Rectangle visible = PlacementBounds();
+            Native.RECT rect = new Native.RECT { left = _baseX + visible.Left, top = _baseY + visible.Top,
+                right = _baseX + visible.Right, bottom = _baseY + visible.Bottom };
+            var info = new Native.MONITORINFO(); info.cbSize = Marshal.SizeOf(typeof(Native.MONITORINFO));
+            IntPtr monitor = Native.MonitorFromRect(ref rect, 2); // MONITOR_DEFAULTTONEAREST
+            if (monitor == IntPtr.Zero || !Native.GetMonitorInfo(monitor, ref info)) return;
+            Point point = FitPosition(_baseX, _baseY, visible, info.monitor);
+            if (point.X != _baseX || point.Y != _baseY) MovePetTo(point.X, point.Y);
+        }
+
+        private void ResetPosition()
+        {
+            SetMoveMode(false);
+            Native.RECT work = new Native.RECT();
+            if (!Native.SystemParametersInfo(0x0030, 0, ref work, 0)) return;
+            Point point = FitPosition(work.right - _winW - S(12), work.bottom - _winH - S(8), new Rectangle(0, 0, _winW, _winH), work);
+            MovePetTo(point.X, point.Y);
+        }
+
         // TOPMOST の再保証。WS_EX_TOPMOST は作成時の一度きりでは不十分だった。
         // 実運用で VS Code の背面へ回る現象を確認しており、何らかの理由で
         // TOPMOST を失った場合に再保証する経路が無かった (失った具体的な契機は
@@ -1520,6 +1707,7 @@ namespace ClaudePet
 
         private void HidePet()
         {
+            if (_moveMode) SetMoveMode(false);
             if (!_petVisible) return;
             _petVisible = false;
             ArmSpriteTimer();
@@ -1598,38 +1786,109 @@ namespace ClaudePet
             }
         }
 
-        private void ShowTrayMenu()
+        // Only the explicitly opened native menu grows. The card renderer and window size stay unchanged.
+        private IntPtr CreateTrayMenu()
         {
             IntPtr menu = Native.CreatePopupMenu();
+            if (menu == IntPtr.Zero) return menu;
+            Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? Native.MF_GRAYED : 0),
+                (uint)CmdShowPet, "忍者を表示");
+            Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? 0 : Native.MF_GRAYED),
+                (uint)CmdHidePet, "忍者を隠す");
+            Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdBringToFront, "最前面に戻す");
+            Native.AppendMenu(menu, Native.MF_STRING | (_moveMode ? Native.MF_CHECKED : 0),
+                (uint)CmdMovePet, _moveMode ? "位置の移動をやめる" : "位置を移動（ドラッグ）");
+            Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdResetPosition, "右下に戻す");
+            Native.AppendMenu(menu, Native.MF_STRING | (_completionSound ? Native.MF_CHECKED : 0),
+                (uint)CmdCompletionSound, "完了音を鳴らす");
+            Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
+            Native.AppendMenu(menu, Native.MF_STRING | Native.MF_GRAYED, 0, "表示する作業（選ぶと固定）");
+            string pinned = PinnedSession();
+            Native.AppendMenu(menu, Native.MF_STRING | (pinned == null ? Native.MF_CHECKED : 0),
+                (uint)CmdAutoDisplay, "自動で切り替える");
+            _workMenuChoices.Clear();
+            foreach (var kv in _sessions)
+                if (IsActive(kv.Value.State)) _workMenuChoices.Add(new DisplayChoice(kv.Key, kv.Value));
+            _workMenuChoices.Sort(delegate(DisplayChoice a, DisplayChoice b)
+            {
+                return b.Session.LastSeq.CompareTo(a.Session.LastSeq);
+            });
+            if (_workMenuChoices.Count > MaxSessions)
+                _workMenuChoices.RemoveRange(MaxSessions, _workMenuChoices.Count - MaxSessions);
+            for (int i = 0; i < _workMenuChoices.Count; i++)
+            {
+                DisplayChoice choice = _workMenuChoices[i];
+                Native.AppendMenu(menu, Native.MF_STRING | (pinned == choice.Key ? Native.MF_CHECKED : 0),
+                    (uint)(CmdWorkFirst + i), WorkMenuText(choice.Session, i + 1));
+            }
+            if (_workMenuChoices.Count == 0)
+                Native.AppendMenu(menu, Native.MF_STRING | Native.MF_GRAYED, 0, "進行中の作業はありません");
+            Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
+            Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdClaudeDiagnostics, "Claude の進捗を診断");
+            Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "Tiny Code Petを終了");
+            return menu;
+        }
+
+        private static string WorkMenuText(Session s, int number)
+        {
+            // Existing project metadata only: no task labels, paths or session/turn identifiers.
+            string project = WorkDetails.Clean(s.Project);
+            if (project.Length == 0) project = "プロジェクト未指定";
+            if (project.Length > 28)
+            {
+                int length = char.IsHighSurrogate(project[27]) ? 27 : 28;
+                project = project.Substring(0, length) + "…";
+            }
+            string state = s.State == Session.Waiting ? "入力・承認待ち" :
+                s.State == Session.Finalizing ? "終了通知後の待機中" : "作業中";
+            int pct = s.ProgressPercent();
+            return number + ". " + (s.IsCodex ? "Codex" : "Claude") + " · " +
+                project.Replace("&", "&&") + " · " + state +
+                (pct < 0 ? "" : " · 全体 推定 " + pct + "%");
+        }
+
+        private void ShowTrayMenu()
+        {
+            if (_trayMenuOpen) return;
+            IntPtr menu = CreateTrayMenu();
             if (menu == IntPtr.Zero) return;
+            _trayMenuOpen = true;
             try
             {
-                Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? Native.MF_GRAYED : 0),
-                    (uint)CmdShowPet, "忍者を表示");
-                Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? 0 : Native.MF_GRAYED),
-                    (uint)CmdHidePet, "忍者を隠す");
-                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdBringToFront, "最前面に戻す");
-                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdClaudeDiagnostics, "Claude の進捗を診断");
-                Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
-                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "Tiny Code Petを終了");
-
                 Native.POINT pt;
                 Native.GetCursorPos(out pt);
                 // 標準の tray menu パターン。SetForegroundWindow が無いと
                 // menu の外をクリックしても閉じない。Pet window は click-through +
                 // NOACTIVATE なので、これで keyboard 入力を奪い続けることはない。
                 Native.SetForegroundWindow(_hwnd);
-                Native.TrackPopupMenuEx(menu, Native.TPM_RIGHTBUTTON, pt.x, pt.y, _hwnd, IntPtr.Zero);
+                // Dispatch before another menu can replace the command-to-request snapshot.
+                uint command = Native.TrackPopupMenuEx(menu, Native.TPM_RIGHTBUTTON | Native.TPM_NONOTIFY |
+                    Native.TPM_RETURNCMD, pt.x, pt.y, _hwnd, IntPtr.Zero);
                 Native.PostMessage(_hwnd, Native.WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                if (command != 0) OnTrayCommand((int)command);
             }
-            finally { Native.DestroyMenu(menu); }
+            finally { Native.DestroyMenu(menu); _trayMenuOpen = false; }
         }
 
         private void OnTrayCommand(int id)
         {
             PetDebug("tray-cmd=" + id);
+            if (id >= CmdWorkFirst && id < CmdWorkFirst + _workMenuChoices.Count)
+            {
+                DisplayChoice choice = _workMenuChoices[id - CmdWorkFirst];
+                if (IsCurrentChoice(choice)) _pinnedWork = choice;
+                RenderCurrent(true);
+                return;
+            }
             switch (id)
             {
+                case CmdMovePet:
+                    if (!_petVisible) ShowPet();
+                    SetMoveMode(!_moveMode);
+                    break;
+                case CmdResetPosition: ResetPosition(); break;
+                case CmdCompletionSound: _completionSound = !_completionSound; break;
+                case CmdAutoDisplay: _pinnedWork = null; RenderCurrent(true); break;
                 case CmdShowPet: ShowPet(); break;
                 case CmdHidePet: HidePet(); break;
                 case CmdBringToFront: BringToFront(); break;

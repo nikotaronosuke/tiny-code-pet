@@ -23,6 +23,8 @@
   静止中は次の変化までtimerを寝かせ、非表示中・one-shot終了後は停止する。
 - 待機・作業ではmotionRegions外をframe 0で固定し、頭・足・マフラーを揺らさない。
 - 旧版のCPU/RAM実測を新版へ流用しない。HUDはキャッシュし、表示が変わった場合だけ再生成する。経過秒の更新は表示中の既存animation timerを利用し、TOPMOSTは再保証しない。
+- 明示的な位置移動モード中だけclick-throughを解除し、ドラッグ終了・取消・非表示で戻す。
+  移動はWin32イベント駆動、位置はメモリ内のみ。通常操作のfocusを奪わずカードを拡大しない。
 - click-through / 背景透過 / always-on-top / タスクバー非表示という
   現在の UI 特性を壊さない。
 - TOPMOST の再保証は event-driven のみ (表示内容の変化時と明示操作時)。
@@ -32,6 +34,8 @@
   WinForms NotifyIcon / 別常駐 helper を導入しない。
   「忍者を隠す」は visual hide であり、hooks 受信・進捗・完了判定は
   hidden 中も継続する (hidden 中は完了音を鳴らさない)。
+- 完了音はtrayでON/OFF可能。既定ON・メモリ内のみ。音設定は完了判定や表示を変えない。
+- Waitingでは手を止めたまばたき。観測した待ち状態だけで切り替え、分身は作業動作を維持する。
 
 ## Privacy
 

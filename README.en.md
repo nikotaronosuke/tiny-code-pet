@@ -22,11 +22,47 @@ Claude Code and Codex can be monitored at the same time without their session st
 | 🤖 **Claude Code + Codex** | One pet can monitor either provider or both at once |
 | 🪟 **Native Windows UI** | Pure Win32 via C# P/Invoke — no Electron, WebView, resident Node process, localhost server, or DB |
 | 🚫 **Stays out of the way** | Click-through, hidden from taskbar / Alt+Tab, never steals focus |
-| 🥷 **System tray controls** | Show / hide / bring to front / exit |
+| 🥷 **System tray controls** | Show / hide / move / sound / work list and pinning / exit |
 | 📊 **Whole-request progress** | Estimated from the request's structured plan, not from tool-call counts or elapsed time |
 | ✅ **Completion = root Stop + 20 s quiet** | Completion is independent from task tracker percentages |
 | 🔒 **Privacy boundary** | Does not read prompt text, assistant responses, source code, tool command bodies, or transcripts |
 | 🥷 **Ninja + shadow clones** | Idle / working / completed animation plus up to six visible subagents |
+
+## Position, completion sound and input waits
+
+- Right-click the tray ninja and select `位置を移動（ドラッグ）`, then drag the ninja or card.
+  Releasing it restores normal click-through behavior. Before dragging, the same menu can cancel
+  move mode. `右下に戻す` returns to the default bottom-right position. Starting move mode while
+  hidden shows the pet.
+- Placement uses visible artwork rather than the transparent canvas. Transparent margins can
+  extend beyond the display, allowing the card, ninja and clones to reach the physical screen edges,
+  including the taskbar area. Placement can move between monitors. Display changes or growing
+  content keep the visible artwork onscreen without resizing or repositioning on animation ticks.
+  Drawing dimensions retain the startup DPI.
+- Toggle `完了音を鳴らす` to enable or mute completion sound (enabled by default). Completion
+  detection and the completion pose still work while muted; hidden pets are always silent.
+- An observed input/approval wait stops the main ninja's hands and uses a quiet eye blink.
+  Continuation restores the working animation. Observed children keep their working animation;
+  silence alone never implies an input wait.
+
+Position and sound preferences are held only for this pet process. Restarting returns to the
+bottom-right position with sound enabled. No coordinate/settings file, polling or AI call is added.
+
+## Work list and display pinning
+
+Right-click the ninja in the system tray to list up to eight active requests. Each entry shows
+Claude / Codex, the project, the state, and estimated progress only when valid counts are available.
+Long project names are shortened; numbers identify entries within that menu.
+
+- Select a request to keep it on the main card. A check mark indicates the pinned request.
+- Select `自動で切り替える` to resume automatic selection of the latest active request.
+- Completion, interruption, removal, or a new request in the same session releases the pin.
+- Input / approval waits and the 20-second post-Stop quiet period retain the pin.
+- Menu contents are a snapshot; reopen it to see updated values.
+
+The card dimensions, text rows and spacing between the card and ninja remain unchanged. Pinning only selects what
+is displayed; tracking, progress, completion and shadow clones continue normally. Selecting while
+hidden keeps the pet hidden. Pins are held in memory and do not survive a pet restart.
 
 ## Visible states
 

@@ -497,8 +497,8 @@ TOPMOST 同士は Windows 標準の前後関係とし、隠れたら tray から
 - menu は `TrackPopupMenuEx` + 事前 `SetForegroundWindow` + 事後 `WM_NULL` の
   標準 tray パターン。Pet window は click-through + NOACTIVATE なので
   menu 後に入力を奪い続けることはない
-- menu 選択は `WM_COMMAND` で届く (TPM_RETURNCMD 不使用)。テストが同じ
-  message を post して同一経路を検証できる
+- menu 選択は共通のOnTrayCommandで処理する。作業一覧追加後はTPM_RETURNCMDで
+  選択を同期的に受け取る。明示的なWM_COMMANDも同じdispatchを通る
 - NOTIFYICONDATA は V1 (szTip まで) レイアウト。バルーンや version 4 の
   機能は使わないため
 - 追加失敗は fail-soft: tray が無くても Pet 本体は通常動作
@@ -1083,3 +1083,88 @@ Codexの意味付け、nested Claude抑制、分身、完了判定は変更し�
 診断の依頼リセット・provider分離・privacy、描画・分身・20秒静穏。
 実Claudeセッションでのツール提供・Hook受信・tray操作は別途実機確認が必要。
 設定変更は明示承認・DryRun・バックアップを前提とし、この変更には含めない。
+
+
+## 作業一覧と依頼単位の表示固定（2026-10）
+
+複数作業の確認と表示固定は既存のWin32 tray menuに収める。
+メインカードを広げず、PetRenderer・ウィンドウ寸法・行数・忍者と分身の配置は変更しない。
+新しい画面、常駐プロセス、timer、外部通信、設定ファイルは追加しない。
+
+- 一覧はactive (Working / Waiting / Finalizing)のみ、最大8件。最新イベント順。
+  provider・既存のproject名・状態・取得できた推定進捗だけを表示する。
+  project名は28文字までで省略、制御文字除去とWin32 menuの`&`エスケープを行う。
+  session/turn/agentの識別子や工程本文を一覧・ログに出さない。
+- メニューは開いた時のsnapshot。動的command IDは一覧位置を表すだけ。
+  TPM_RETURNCMD + TPM_NONOTIFYで選択を同期dispatchし、メニューの再入を防ぐ。
+  次のメニュー構築と遅延WM_COMMANDの取り違えを防止する。
+- 固定対象はsession keyだけでなくSessionオブジェクトとRequestGenを保持する。
+  メニュー表示中のHook受信や削除・同じkeyでの再作成・新しい依頼を考慮し、
+  選択時と表示時に一致とactive状態を再検証する。古い選択を新しい依頼へ転用しない。
+- 入力待ちとFinalizingはactiveなので固定を維持する。終了・中断・prune・新依頼で
+  無効になった固定は表示選択またはメニュー構築時に破棄し、自動表示へ戻す。
+  非表示中の操作で表示を有効にしない。再起動時の復元や設定永続化は行わない。
+- 固定はメニューと表示選択だけで参照する。件数計算、FinalizeDue、20秒の静穏、
+  他active存在時の完了通知抑制、Codex子agentの進捗抑制は従来処理を維持する。
+  Celebratingを固定できないためactive優先も変わらない。
+
+テスト対象: native menuの文字列とチェック、取得できない進捗の非表示、2 provider間の
+表示選択、古いmenu選択・新依頼・session再作成の拒否、自動復帰、非表示維持、
+既存の完了/分身条件、100%/125%/200% DPIでカード描画領域を増やさないこと。
+
+
+## 自由配置・完了音切り替え・入力待ちのしぐさ（2026-10）
+
+ユーザー依頼の3点のみ追加。表示固定の目印は追加せず、PetRenderer・カードの大きさ・
+行数と忍者との間隔を維持する。依存追加・外部通信・Hook変更・設定永続化は行わない。
+位置と音はプロセス内だけ保持し、座標はログやファイルに保存しない。
+
+### 位置
+
+trayで明示的に移動を選んだ間だけWS_EX_TRANSPARENTを外し、WM_NCHITTESTで
+HTCAPTIONを返す。Windows標準のドラッグを使い、NOACTIVATE / TOOLWINDOWを維持。
+WM_MOUSEACTIVATEもMA_NOACTIVATEを返す。操作中のカーソルは移動用に変わる。
+WM_MOVING / WM_MOVEで描画原点を追従させ、animation更新による位置の巻き戻りを防ぐ。
+WM_EXITSIZEMOVEは最終的なWindowRectを読み、クリック透過を戻す。メニュー取消・
+非表示・右下への復帰でも移動モードを解除する。描画寸法は起動時の値のまま。
+
+ドラッグ終了とWM_DISPLAYCHANGE / WM_SETTINGCHANGEで最寄りモニタへ位置を補正する。
+下記の画面端修正後は可視領域を基準に物理画面全体へ置ける。負の座標も扱う。補正はSWP_NOSIZE /
+NOZORDER / NOACTIVATEで行い、追加timerやマウスのpollingは使わない。
+再起動は従来どおりプライマリ右下、必要ならtrayの「右下に戻す」で戻せる。
+
+### 音
+
+既存の唯一のMessageBeep呼び出しを「完了が確定・表示中・音ON」の場合だけにする。
+既定ONでチェックメニューから切り替え。FinalizeDueの20秒・他activeの抑制・
+継続によるcandidate取消・進捗との独立性は変更しない。音を再生待ちに積まない。
+
+### 入力待ち
+
+Session.WaitingだけをSpriteAnimatorのwaiting動作に対応させる。タイトルは作業中のまま。
+既存idle画像のframe 0を基準に、目の領域だけを動かす。1.8秒静止後、120ms間隔で
+8フレームのまばたきを再生する。新しい画像生成・画像ファイルは不要。
+分身は親の待ち状態に関わらず既存working画像・400ms動作を維持し、必要な次の
+フレーム時刻だけ既存timerで起こす。非表示中はtimerを止める。Finalizingはこの動作にしない。
+
+検証は非表示のテスト専用ウィンドウと架空のイベントを使用する。対象は移動モードの
+style/hit-test・原点追従・サイズ維持・画面外復帰・音の条件・provider共通の待ち/再開・
+目以外の画素不変・分身動作・既存の進捗と完了判定。ローカルWindowsで330項目のテストと
+警告なしのビルドが成功。物理マウスによる画面端へのドラッグは利用者の実機で確認済み。
+異なるDPIの実モニタ間移動、実際のスピーカー音は別途実機確認が必要。
+
+
+### 画面端に寄せられない問題の修正
+
+旧FitPositionは透明canvas全体を作業領域内へ戻していたため、カード外側や忍者下の
+透明余白を画面外へ出せなかった。タスクバー手前にも制限していた。
+
+配置補正は合成画像のalpha領域と、現在のアニメーション全ポーズの可視領域を基準にする。
+SpriteAnimatorは状態・描画サイズ別に全ポーズの領域をキャッシュする。分身がない場合は
+分身の行を予約しない。出入りする場合は全サイズの分身と煙の領域も確保する。
+透明領域だけが画面外へ出ることを許可し、MonitorInfo.monitorの物理画面端へ配置できる。
+MonitorFromRectにも可視領域を渡すので、透明余白が隣のモニタに入っても選択を誤りにくい。
+
+HUD・表示状態・分身数の更新時は領域を再評価し、カードが増えたときも表示を保つ。
+移動モード中とアニメーションだけのtickでは位置補正しない。カードのサイズ、描画、
+Hook、進捗率、完了判定は変更しない。「右下に戻す」は従来のタスクバーを避けた初期位置。
