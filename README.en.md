@@ -103,6 +103,30 @@ This means:
 
 It does **not** mean the produced code or artifact is guaranteed correct.
 
+## When Claude progress is missing
+
+Starting with Claude Code v2.1.233, task-tracking tools are disabled by default on
+selected newer models (including Opus 4.8 and Sonnet 5). Set
+`CLAUDE_CODE_ENABLE_TODO_TOOLS=1` to enable them.
+[Official changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md#21233)
+
+Right-click the tray ninja and select **Claude の進捗を診断**. The on-demand report
+distinguishes missing Claude hooks, missing Task/Todo events, observed tools without
+usable counts, unparseable status metadata, fewer than two valid tasks, and usable progress.
+It covers the latest retained Claude session at the time the report is opened.
+Diagnostics reset with each request and do not retain finished-session history.
+Older adapters cannot distinguish every create/read-tool observation.
+
+Missing events alone cannot prove that tools are disabled: they may be unused or
+hooks may not reach Pet. Enabling tools still requires an actual whole-request plan
+with at least two tasks and delivery of its hooks. Parsing failures preserve the last
+valid progress; time and tool-call counts never manufacture a percentage.
+
+No settings are changed automatically. Changes require explicit approval, a DryRun
+of the intended diff, and a backup. Verify tool availability and event delivery in a
+new Claude session. Diagnostics expose no content or identifiers. The ordinary HUD,
+ninja/clones, Codex progress, and Stop + 20-second completion remain unchanged.
+
 ## Current step and elapsed time
 
 When the provider exposes a structured current step, the HUD can also show:

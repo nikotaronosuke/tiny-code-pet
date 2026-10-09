@@ -19,6 +19,103 @@ internal static class NinjaTests
     private static T Get<T>(object app, string name) { return (T)app.GetType().GetField(name,Flags).GetValue(app); }
     private static void Claude(PetApp a, int ev, string extra) { Call(a,"OnEvent",ev,"fixture-session","fixture-project",extra); }
     private static void Codex(PetApp a, int ev, string extra, string turn) { Call(a,"OnCodexEvent",ev,"fixture-session","fixture-project",extra,turn); }
+    private static void ProgressEvent(string json, string tool, string agent, int expected, string extra)
+    {
+        int actual; string result;
+        ClaudePetNotify.Program.NormalizeProgress(json, tool, agent, out actual, out result);
+        Check(actual == expected && result == extra, "Claude adapter " + tool + " -> " + expected + " bounded metadata");
+    }
+
+    private static void TestClaudeProgressAdapter()
+    {
+        ProgressEvent("{\"tool_input\":{\"todos\":[{\"status\":\"completed\"},{\"status\":\"pending\"}]}}", "TodoWrite", "", 8, "1/0/2|");
+        ProgressEvent("{\"tool_input\":{\"todos\":[]}}", "TodoWrite", "", 8, "0/0/0|");
+        ProgressEvent("{\"tool_input\":{\"todos\":[{\"status\":\"unknown\"}]}}", "TodoWrite", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_response\":{\"todos\":[{\"status\":\"completed\"}]}}", "TodoWrite", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_input\":{\"todos\":[", "TodoWrite", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_input\":{\"todos\":[{\"status\":\"completed\"}]}}", "TodoWrite", "child", 4, "");
+        foreach (string tool in new string[] { "TaskCreate", "TaskGet", "TaskList" })
+        {
+            ProgressEvent("{\"tool_response\":\"PRIVATE_FIXTURE\"}", tool, "", 4, PetEvent.StructuredNoCounts);
+            ProgressEvent("{}", tool, "child", 4, "");
+        }
+        ProgressEvent("{}", "Bash", "", 4, "");
+        string input = "{\"tool_input\":{\"taskId\":\"fixture-task\",\"status\":\"{STATUS}\"},\"tool_response\":\"PRIVATE_FIXTURE\"}";
+        ProgressEvent(input.Replace("{STATUS}","completed"), "TaskUpdate", "", 7, "fixture-task");
+        ProgressEvent(input.Replace("{STATUS}","in_progress"), "TaskUpdate", "", 10, "fixture-task");
+        ProgressEvent(input.Replace("{STATUS}","deleted"), "TaskUpdate", "", 9, "fixture-task");
+        ProgressEvent(input.Replace("{STATUS}","cancelled"), "TaskUpdate", "", 9, "fixture-task");
+        ProgressEvent(input.Replace("{STATUS}","pending"), "TaskUpdate", "", 4, PetEvent.StructuredNoCounts);
+        ProgressEvent(input.Replace("{STATUS}","unknown"), "TaskUpdate", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent(input.Replace("{STATUS}","completed"), "TaskUpdate", "child", 4, "");
+        ProgressEvent("{\"tool_input\":{\"task_id\":\"fixture-task\",\"status\":\"completed\"}}", "TaskUpdate", "", 7, "fixture-task");
+        ProgressEvent("{\"tool_input\":{\"taskId\":\"fixture-task\",\"subject\":\"PRIVATE_FIXTURE\"}}", "TaskUpdate", "", 4, PetEvent.StructuredNoCounts);
+        ProgressEvent("{\"tool_input\":{\"status\":\"completed\"}}", "TaskUpdate", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_input\":{\"taskId\":\"bad\\nline\",\"status\":\"completed\"}}", "TaskUpdate", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_input\":{\"taskId\":\"a\",\"status\":\"pending\",\"status\":\"completed\"}}", "TaskUpdate", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_response\":{\"tool_input\":{\"taskId\":\"fake\",\"status\":\"completed\"}}}", "TaskUpdate", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_input\":{\"metadata\":{\"taskId\":\"fake\",\"status\":\"completed\"}}}", "TaskUpdate", "", 4, PetEvent.StructuredObserved);
+        ProgressEvent("{\"tool_input\":{\"taskId\":\"real\",\"metadata\":{\"status\":\"completed\"}}}", "TaskUpdate", "", 4, PetEvent.StructuredNoCounts);
+        ProgressEvent("{\"tool_response\":{},\"tool_input\":{\"status\":\"completed\",\"taskId\":\"fixture-task\"}}", "TaskUpdate", "", 7, "fixture-task");
+        Check(ClaudePetNotify.Program.ReadMetadataString("{\"tool_response\":{\"tool_name\":\"TodoWrite\"},\"tool_name\":\"Bash\"}", "tool_name")=="Bash", "root tool routing ignores nested metadata");
+        Check(ClaudePetNotify.Program.ReadMetadataString("{\"tool_response\":{\"agent_id\":\"fake\"}}", "agent_id")=="", "nested agent cannot suppress root progress");
+        Check(ClaudePetNotify.Program.ReadMetadataString("{\"task_id\":\"fixture\",\"task_id\":\"other\"}", "task_id")=="", "duplicate metadata cannot contribute progress");
+        int done, active, total;
+        Check(!WorkDetails.TryCounts("2147483647/2147483647/2", out done, out active, out total), "overflow counts rejected");
+        Check(!WorkDetails.TryCounts("-1/0/2", out done, out active, out total), "negative counts rejected");
+        Check(!WorkDetails.TryCounts("1/2", out done, out active, out total), "incomplete counts rejected");
+    }
+
+    private static void TestClaudeProgressDiagnostics(PetApp app, Dictionary<string,Session> sessions)
+    {
+        Check(((string)Call(app,"BuildClaudeDiagnostics")).Contains("Claude Hook：未受信"), "diagnose no Claude hooks");
+        Codex(app,20,"","diagnostic-turn"); Codex(app,22,"1/1/4","diagnostic-turn");
+        Check(((string)Call(app,"BuildClaudeDiagnostics")).Contains("Claude Hook：未受信"), "Codex does not imply Claude reception");
+        Codex(app,25,"","diagnostic-turn");
+        Claude(app,11,"");
+        Check(sessions["fixture-session"].State==Session.MetadataOnly, "diagnostics do not activate metadata session");
+        Claude(app,2,"");
+        Session s=sessions["fixture-session"];
+        Check(s.ClaudeProgressDiagnostic().Contains("PostToolUse / Task/Todo 未受信"), "request has no activity yet");
+        Claude(app,4,"");
+        Check(s.ClaudeProgressDiagnostic().Contains("Task/Todo 未受信（通常"), "normal activity distinguished from tracker");
+        Claude(app,4,PetEvent.StructuredNoCounts);
+        Check(s.ClaudeProgressDiagnostic().Contains("件数情報なし") && s.ProgressPercent()==-1, "read-only tracker does not invent counts");
+        Claude(app,4,PetEvent.StructuredObserved);
+        Check(s.ClaudeProgressDiagnostic().Contains("解析不可") && s.ProgressPercent()==-1, "parse failure distinguished from absent tracker");
+        Claude(app,8,"0/0/0|");
+        Check(s.ClaudeProgressDiagnostic().Contains("工程数不足：0") && s.ProgressPercent()==-1, "empty tracker is not parse failure");
+        Claude(app,8,"0/1/1|");
+        Check(s.ClaudeProgressDiagnostic().Contains("工程数不足：1") && s.ProgressPercent()==-1, "one task never makes percentage");
+        Claude(app,8,"1/1/4");
+        Check(s.ClaudeProgressDiagnostic().Contains("37%") && s.ProgressPercent()==37, "legacy snapshot restores diagnostics");
+        Claude(app,4,PetEvent.StructuredObserved);
+        Check(s.ClaudeProgressDiagnostic().Contains("解析不可") && s.ProgressPercent()==37, "parse failure preserves previous snapshot");
+        Claude(app,8,"1/0/2|");
+        Check(s.ClaudeProgressDiagnostic().Contains("50%"), "valid snapshot clears parse failure");
+        Claude(app,8,"bad");
+        Check(s.ClaudeProgressDiagnostic().Contains("解析不可") && s.ProgressPercent()==50, "malformed wire snapshot diagnosed without overwriting progress");
+        Claude(app,2,"");
+        Check(!s.SawStructuredTasks && !s.SawClaudeActivity && !s.ClaudeProgressParseFailed && s.ProgressPercent()==-1, "new request resets diagnostics");
+        Claude(app,6,"fixture-task-a"); Claude(app,6,"fixture-task-a");
+        Check(s.ClaudeProgressDiagnostic().Contains("工程数不足：1"), "duplicate lifecycle events do not inflate task count");
+        Claude(app,6,"fixture-task-b"); Claude(app,10,"fixture-task-a");
+        Check(s.ProgressPercent()==25 && s.ClaudeProgressDiagnostic().Contains("25%"), "legacy task events still compute progress");
+        Claude(app,7,"fixture-task-a"); Claude(app,7,"fixture-task-a");
+        Check(s.ProgressPercent()==50, "duplicate completed events remain idempotent");
+        Claude(app,9,"fixture-task-b");
+        Check(s.ClaudeProgressDiagnostic().Contains("工程数不足：1") && s.ProgressPercent()==-1, "removed task can reduce total below threshold");
+        Claude(app,1,"");
+        DateTime deadline=s.QuietDueUtc; long sequence=s.LastSeq;
+        string report=(string)Call(app,"BuildClaudeDiagnostics");
+        Check(s.State==Session.Finalizing && s.QuietDueUtc==deadline && s.LastSeq==sequence, "opening diagnostics cannot alter completion candidate");
+        Check(!report.Contains("fixture-session") && !report.Contains("fixture-task") && !report.Contains("fixture-project"), "diagnostic text excludes identifiers and project");
+        s.QuietDueUtc=DateTime.UtcNow.AddSeconds(-1); Call(app,"FinalizeDue");
+        Check(s.State==Session.Celebrating, "insufficient progress still completes after quiet window");
+        Call(app,"OnRevert");
+        Check(sessions.Count==0 && ((string)Call(app,"BuildClaudeDiagnostics")).Contains("保持中の Claude セッションはありません"), "finished request does not present stale diagnosis");
+    }
+
     public static int Main(string[] args)
     {
         try { Run(args[0]); Console.WriteLine("PASS: " + assertions + " assertions; state, sprite, privacy, render and resource checks."); return 0; }
@@ -104,6 +201,8 @@ internal static class NinjaTests
                 Check(ink>3000 && ink<14000,"sprite silhouette");
             }
         }
+        TestClaudeProgressAdapter();
+
         // Message-only test window: never targets or shows the user's running pet.
         IntPtr hwnd=Native.CreateWindowEx(0,"STATIC","ninja-tests",0,0,0,1,1,new IntPtr(-3),IntPtr.Zero,IntPtr.Zero,IntPtr.Zero);
         Check(hwnd!=IntPtr.Zero,"isolated test window");
@@ -111,6 +210,7 @@ internal static class NinjaTests
         var sessions=Get<Dictionary<string,Session>>(app,"_sessions");
         try
         {
+            TestClaudeProgressDiagnostics(app, sessions);
             Claude(app,12,"a"); Check(sessions.Count==0,"child does not create root");
             Claude(app,2,""); Claude(app,12,"a"); Claude(app,12,"a");
             Session c=sessions["fixture-session"]; Check(c.Subagents.Count==1,"Claude clone");

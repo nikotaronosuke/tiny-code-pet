@@ -207,6 +207,9 @@ namespace ClaudePet
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int MessageBox(IntPtr hWnd, string text, string caption, uint type);
+
         [DllImport("user32.dll")]
         public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize,
             IntPtr hdcSrc, ref POINT pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
@@ -328,6 +331,7 @@ namespace ClaudePet
         // という事実だけを伝える。本文は一切含まない。
         // src/Notify.cs / src/CodexNotify.cs の同名定数と一致させること。
         public const string StructuredObserved = "structured-observed";
+        public const string StructuredNoCounts = "structured-no-counts";
     }
 
     internal sealed class Session
@@ -386,6 +390,44 @@ namespace ClaudePet
         // ResetRequest() 以外では false へ戻さない (fail-closed)。
         public bool SawStructuredTasks;
 
+        // Diagnostics only. Never used by progress arithmetic or completion.
+        public bool SawClaudeActivity;
+        public bool SawClaudeProgressMetadata;
+        public bool ClaudeProgressParseFailed;
+
+        public void ObserveClaudeProgress(int eventType, string extra)
+        {
+            if (eventType == PetEvent.Activity) SawClaudeActivity = true;
+            if (extra == PetEvent.StructuredObserved)
+            { SawStructuredTasks = true; ClaudeProgressParseFailed = true; return; }
+            if (extra == PetEvent.StructuredNoCounts)
+            { SawStructuredTasks = true; return; }
+            if (eventType < PetEvent.TaskCreated || eventType > PetEvent.TaskInProgress) return;
+            SawStructuredTasks = true;
+            int done, active, total;
+            bool valid = eventType == PetEvent.TaskSnapshot
+                ? WorkDetails.TryCounts(extra, out done, out active, out total)
+                : !string.IsNullOrEmpty(extra);
+            ClaudeProgressParseFailed = !valid;
+            if (valid) SawClaudeProgressMetadata = true;
+        }
+
+        public string ClaudeProgressDiagnostic()
+        {
+            if (!SawStructuredTasks)
+                return SawClaudeActivity ? "Task/Todo 未受信（通常のツール通知は受信済み）"
+                    : "PostToolUse / Task/Todo 未受信（この依頼の観測範囲）";
+            if (ClaudeProgressParseFailed)
+                return "Task/Todo 受信済み・status metadata の解析不可。最後の有効な進捗値は保持。";
+            if (!SawClaudeProgressMetadata)
+                return "Task/Todo 受信済み・件数情報なし（作成・参照・status なし更新など）";
+            int done, active, total;
+            GetProgress(out done, out active, out total);
+            if (total < MinProgressTotal)
+                return "工程数不足：" + total + "（2工程以上の有効な情報が必要）";
+            return "進捗表示可能：全体 推定 " + ProgressPercent() + "%";
+        }
+
         // root Stop 後の quiet window 満了時刻 (未設定 = completion candidate 無し)。
         // provider 共通。継続イベントで取消し、Stop 再受信で張り直す。
         public DateTime QuietDueUtc;
@@ -406,6 +448,9 @@ namespace ClaudePet
             SnapDone = 0;
             SnapInProg = 0;
             SawStructuredTasks = false;
+            SawClaudeActivity = false;
+            SawClaudeProgressMetadata = false;
+            ClaudeProgressParseFailed = false;
             QuietDueUtc = DateTime.MinValue;
             if (CreatedIds != null) { CreatedIds.Clear(); CompletedIds.Clear(); InProgressIds.Clear(); }
         }
@@ -484,6 +529,8 @@ namespace ClaudePet
         private const int CmdShowPet = 1001;      // tray menu: 忍者を表示
         private const int CmdHidePet = 1002;      // tray menu: 忍者を隠す
         private const int CmdBringToFront = 1003; // tray menu: 最前面に戻す
+        private bool _sawClaudeHook;
+        private const int CmdClaudeDiagnostics = 1005;
         private const int CmdExitPet = 1004;      // tray menu: ClaudePetを終了
 
         private IntPtr _hwnd;
@@ -698,6 +745,7 @@ namespace ClaudePet
 
         private void OnEvent(int eventType, string sessionId, string project, string extra)
         {
+            if (eventType >= PetEvent.TaskComplete && eventType <= PetEvent.StopFailure) _sawClaudeHook = true;
             _seq++;
             Session s;
             _sessions.TryGetValue(sessionId, out s);
@@ -735,6 +783,7 @@ namespace ClaudePet
                     s.QuietDueUtc = DateTime.MinValue;
                     // status を読めなかった tracker 観測。進捗値は触らず事実だけ残す
                     if (extra == PetEvent.StructuredObserved) { s.SawStructuredTasks = true; s.CurrentWork = ""; }
+                    s.ObserveClaudeProgress(eventType, extra);
                     ApplyTaskEvent(s, eventType, extra);
                     break;
 
@@ -1062,13 +1111,8 @@ namespace ClaudePet
                 case PetEvent.TaskSnapshot:
                     // extra = "completed/in_progress/total"。TodoWrite の全量スナップショットなので冪等。
                     s.CurrentWork = ""; // Invalid or legacy snapshot must not leave an obsolete label.
-                    string[] nums = extra.Split('|')[0].Split('/');
-                    if (nums.Length != 3) return;
                     int done, inProg, total;
-                    if (!int.TryParse(nums[0], out done)) return;
-                    if (!int.TryParse(nums[1], out inProg)) return;
-                    if (!int.TryParse(nums[2], out total)) return;
-                    if (total < 0 || done < 0 || inProg < 0 || done + inProg > total) return;
+                    if (!WorkDetails.TryCounts(extra, out done, out inProg, out total)) return;
                     s.CurrentWork = inProg == 1 ? WorkDetails.Label(extra) : "";
                     s.SnapTotal = total; // total=0 は「リストが空になった」= 進捗表示なし
                     s.SnapDone = done;
@@ -1565,6 +1609,7 @@ namespace ClaudePet
                 Native.AppendMenu(menu, Native.MF_STRING | (_petVisible ? 0 : Native.MF_GRAYED),
                     (uint)CmdHidePet, "忍者を隠す");
                 Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdBringToFront, "最前面に戻す");
+                Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdClaudeDiagnostics, "Claude の進捗を診断");
                 Native.AppendMenu(menu, Native.MF_SEPARATOR, 0, null);
                 Native.AppendMenu(menu, Native.MF_STRING, (uint)CmdExitPet, "Tiny Code Petを終了");
 
@@ -1588,11 +1633,29 @@ namespace ClaudePet
                 case CmdShowPet: ShowPet(); break;
                 case CmdHidePet: HidePet(); break;
                 case CmdBringToFront: BringToFront(); break;
+                case CmdClaudeDiagnostics:
+                    Native.MessageBox(_hwnd, BuildClaudeDiagnostics(), "Claude の進捗診断", 0x40);
+                    break;
                 case CmdExitPet:
                     // WM_DESTROY が tray / timer の掃除まで行う
                     Native.DestroyWindow(_hwnd);
                     break;
             }
+        }
+
+        private string BuildClaudeDiagnostics()
+        {
+            Session latest = null;
+            foreach (Session s in _sessions.Values)
+                if (!s.IsCodex && (latest == null || s.LastSeq > latest.LastSeq)) latest = s;
+            string text = _sawClaudeHook ? "Claude Hook：受信済み（Pet 起動後）" : "Claude Hook：未受信（Pet 起動後）";
+            text += "\n\n" + (latest == null ? "保持中の Claude セッションはありません。作業中に再度開いてください。"
+                : "最後に通知を受けた保持中の Claude セッション：\n" + latest.ClaudeProgressDiagnostic());
+            return text + "\n\n未受信だけでは、ツール無効・未使用・Hook の未到達を断定できません。"
+                + "\nClaude Code v2.1.233 以降の対象モデルでは、Task/Todo は既定で無効です。"
+                + "\n有効化設定：CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
+                + "\n設定は自動変更しません。有効化しても実際の工程表と Hook 受信が必要です。"
+                + "\n\nこの診断は開いた時点の情報です。本文・識別子は表示・保存しません。";
         }
 
         private void ApplyBitmap(Bitmap bmp, int x, int y)

@@ -1050,3 +1050,36 @@ status抽出境界、ラベルの制御文字・長さ制限、旧payload、旧t
 更新途中のPet再起動で開始Hookは未観測のためobservedStart=Falseとなり「観測から」で表示。
 次のPromptSubmitで依頼開始の時計へ切り替わる。追加のモデルテスト・Hook設定変更は行っていない。
 診断flagは検証後に除去。今回の変更はローカルのみで、commit/pushは未実施。
+
+
+## Claude progress diagnostics (2026-10-09)
+
+[Anthropicのv2.1.233変更履歴](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md#21233)
+では対象の新世代モデルでTodo/Taskツールが既定無効となり、
+`CLAUDE_CODE_ENABLE_TODO_TOOLS=1`で有効化できる。
+Hook登録済みでもツール自体が使われなければ進捗情報は届かない。
+この可能性を未受信の断定原因にはせず、観測できた段階だけ診断する。
+
+通常HUDは変えず、既存のWin32 tray menuから明示的に開く診断を追加。
+Pet起動後のClaude Hook受信有無と、最新の保持中Claude sessionについて
+通常ツールのみ受信 / Task・Todo未受信 / 件数情報なし / 解析不可 /
+工程数不足 / 算出可能を表示する。診断のためのtimer、永続化、設定読み書きは追加しない。
+セッションID・project・本文・工程名は診断へ含めない。新しい依頼で診断をリセットする。
+
+Activity(4)のextraに固定marker `structured-no-counts`を追加。
+TaskCreate/Get/Listとstatus更新を伴わないTaskUpdateの観測を伝え、本文・responseは読まない。
+TaskUpdate(pending)も従来どおり集計を変えず、このmarkerで表現する。
+既存の`structured-observed`は解析不可・未対応metadataとして引き続き受信する。
+正常なstatusイベントで解析不可状態を解除し、件数を持たない観測では解除しない。
+markerの受信は割合を作らず、以前の有効snapshotを保持する。
+旧Petは新markerを通常Activityとして扱える。新Petも旧event番号・3行payloadを受信する。
+
+TaskUpdateのstatus/idとroot振り分けmetadataは既存の構造走査で抽出する。
+入れ子のmetadata・response・本文からstatus/idを拾わず、重複や制御文字を拒否する。
+共通snapshot検証は非負件数と合計をoverflowなしで確認する。
+Codexの意味付け、nested Claude抑制、分身、完了判定は変更しない。
+
+検証対象はadapter正規化、旧Task/Todo互換、重複・削除・不正metadata、
+診断の依頼リセット・provider分離・privacy、描画・分身・20秒静穏。
+実Claudeセッションでのツール提供・Hook受信・tray操作は別途実機確認が必要。
+設定変更は明示承認・DryRun・バックアップを前提とし、この変更には含めない。

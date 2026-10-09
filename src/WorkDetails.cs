@@ -63,6 +63,16 @@ internal static class WorkDetails
         return result.ToString().Trim();
     }
 
+    internal static bool TryCounts(string extra, out int done, out int active, out int total)
+    {
+        done = active = total = 0;
+        if (extra == null) return false;
+        string[] nums = extra.Split('|')[0].Split('/');
+        return nums.Length == 3 && int.TryParse(nums[0], out done) &&
+            int.TryParse(nums[1], out active) && int.TryParse(nums[2], out total) &&
+            total >= 0 && done >= 0 && active >= 0 && active <= total && done <= total - active;
+    }
+
     public static string Label(string extra)
     {
         try

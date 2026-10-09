@@ -61,6 +61,7 @@ namespace ClaudePetNotify
         // 「今回 status を読めなかった」を「tracker を使っていない」へ格下げさせないための印。
         // src/Pet.cs / src/CodexNotify.cs の同名定数と文字列を一致させること。
         private const string StructuredObserved = "structured-observed";
+        private const string StructuredNoCounts = "structured-no-counts";
 
         [StructLayout(LayoutKind.Sequential)]
         private struct COPYDATASTRUCT
@@ -225,10 +226,13 @@ namespace ClaudePetNotify
                 else
                 {
                     string json = ReadStdin();
-                    string eventName = ExtractString(json, "hook_event_name");
-                    string agentId = ExtractString(json, "agent_id");
-                    sessionId = ExtractString(json, "session_id");
-                    project = ToProjectName(ExtractString(json, "cwd"));
+                    string eventName = ReadMetadataString(json, "hook_event_name");
+                    // Only a missing field is the legacy Stop contract. Malformed
+                    // event metadata must not fall through to a success candidate.
+                    if (eventName.Length == 0 && BackgroundWork.Field(json, "hook_event_name") != null) return 0;
+                    string agentId = ReadMetadataString(json, "agent_id");
+                    sessionId = ReadMetadataString(json, "session_id");
+                    project = ToProjectName(ReadMetadataString(json, "cwd"));
 
                     // Nested child Claude 判定 (プロセス祖先チェーン方式):
                     // この helper の親プロセスは hook を発火させた claude 本体。その祖先に
@@ -267,43 +271,12 @@ namespace ClaudePetNotify
                             eventType = EvPermissionPrompt;
                             break;
                         case "PostToolUse":
-                            eventType = EvActivity;
-                            string toolName = ExtractString(json, "tool_name");
-                            if (agentId.Length == 0)
-                            {
-                                if (toolName == "TodoWrite")
-                                {
-                                    // TodoWrite (メインセッションのみ) は進捗スナップショット。
-                                    // subagent の todo list は agent_id 付きなので混ぜない。
-                                    string counts = CountTodoStatuses(json);
-                                    if (counts != null) { eventType = EvTaskSnapshot; extra = counts; }
-                                    else extra = StructuredObserved; // 解析失敗でも tracker 使用の事実は残す
-                                }
-                                else if (toolName == "TaskUpdate")
-                                {
-                                    // 削除 (deleted/cancelled) は対応する hook が発火しないため
-                                    // ここで検知して total から除外する (false incomplete の主因)。
-                                    // completed は TaskCompleted hook の取りこぼし保険 (Set で冪等)。
-                                    string tid, status;
-                                    ParseTaskUpdate(json, out tid, out status);
-                                    if (tid.Length > 0)
-                                    {
-                                        if (status == "deleted" || status == "cancelled")
-                                        { eventType = EvTaskRemoved; extra = tid; }
-                                        else if (status == "in_progress")
-                                        { eventType = EvTaskInProgress; extra = tid; }
-                                        else if (status == "completed")
-                                        { eventType = EvTaskCompleted; extra = tid; }
-                                    }
-                                    // id も status も拾えなかった TaskUpdate は空 Activity にせず
-                                    // tracker 観測として残す
-                                    if (eventType == EvActivity) extra = StructuredObserved;
-                                }
-                            }
+                            string toolName = ReadMetadataString(json, "tool_name");
+                            NormalizeProgress(json, toolName, agentId, out eventType, out extra);
                             break;
                         case "TaskCreated":
                             if (agentId.Length > 0) return 0; // subagent のタスクは数えない
-                            extra = ExtractString(json, "task_id");
+                            extra = ReadMetadataString(json, "task_id");
                             // id が無いと重複判定できないので進捗には数えないが、
                             // tracker を使った事実だけは落とさない
                             if (extra.Length == 0) { eventType = EvActivity; extra = StructuredObserved; break; }
@@ -311,7 +284,7 @@ namespace ClaudePetNotify
                             break;
                         case "TaskCompleted":
                             if (agentId.Length > 0) return 0;
-                            extra = ExtractString(json, "task_id");
+                            extra = ReadMetadataString(json, "task_id");
                             if (extra.Length == 0) { eventType = EvActivity; extra = StructuredObserved; break; }
                             eventType = EvTaskCompleted;
                             break;
@@ -391,17 +364,6 @@ namespace ClaudePetNotify
             catch { return ""; }
         }
 
-        // JSON から文字列フィールドを1つ抽出する (完全な parser は使わない軽量方式)。
-        // 制約: 巨大 text フィールド内に同名の "key":"..." が現れると誤抽出しうるが、
-        // 抽出対象は表示・振り分け用途のみで、実害が出ない範囲として許容する。
-        private static string ExtractString(string json, string key)
-        {
-            if (string.IsNullOrEmpty(json)) return "";
-            Match m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
-            if (!m.Success) return "";
-            return Unescape(m.Groups[1].Value);
-        }
-
         // model は "model":"id" の他に "model":{"id":...} 形式もあり得るので
         // 両方を見る。model 以外の JSON 本文は一切読まない。
         private static string ExtractModelId(string json)
@@ -475,17 +437,55 @@ namespace ClaudePetNotify
             return WorkDetails.Snapshot(json, false);
         }
 
-        private static void ParseTaskUpdate(string json, out string taskId, out string status)
+        // Only root status/id metadata is decoded. Task read/create tools prove
+        // receipt but do not supply a supported full snapshot; never mine responses.
+        internal static void NormalizeProgress(string json, string toolName, string agentId,
+            out int eventType, out string extra)
         {
-            taskId = ""; status = "";
-            int start = json.IndexOf("\"tool_input\"", StringComparison.Ordinal);
-            if (start < 0) return;
-            int end = json.IndexOf("\"tool_response\"", start, StringComparison.Ordinal);
-            string region = (end > start) ? json.Substring(start, end - start) : json.Substring(start);
-            Match mi = Regex.Match(region, "\"(?:taskId|task_id)\"\\s*:\\s*\"([^\"]{1,64})\"");
-            if (mi.Success) taskId = mi.Groups[1].Value;
-            Match ms = Regex.Match(region, "\"status\"\\s*:\\s*\"([a-z_]{1,20})\"");
-            if (ms.Success) status = ms.Groups[1].Value;
+            eventType = EvActivity;
+            extra = "";
+            if (!string.IsNullOrEmpty(agentId)) return;
+            if (toolName == "TodoWrite")
+            {
+                string counts = CountTodoStatuses(json);
+                if (counts != null) { eventType = EvTaskSnapshot; extra = counts; }
+                else extra = StructuredObserved;
+            }
+            else if (toolName == "TaskUpdate")
+            {
+                extra = StructuredObserved;
+                try
+                {
+                    string input = BackgroundWork.Field(json, "tool_input");
+                    string tid = ReadMetadataString(input, "taskId");
+                    if (tid.Length == 0) tid = ReadMetadataString(input, "task_id");
+                    string status = ReadMetadataString(input, "status");
+                    if (tid.Length == 0 || tid.Length > 64) return;
+                    if (status == "deleted" || status == "cancelled") eventType = EvTaskRemoved;
+                    else if (status == "in_progress") eventType = EvTaskInProgress;
+                    else if (status == "completed") eventType = EvTaskCompleted;
+                    else if (status == "pending" || BackgroundWork.Field(input, "status") == null)
+                    { extra = StructuredNoCounts; return; }
+                    else return;
+                    extra = tid;
+                }
+                catch { } // Keep the fixed parse-failure marker; no payload in logs.
+            }
+            else if (toolName == "TaskCreate" || toolName == "TaskGet" || toolName == "TaskList")
+                extra = StructuredNoCounts;
+        }
+
+        internal static string ReadMetadataString(string json, string key)
+        {
+            try
+            {
+                string raw = BackgroundWork.Field(json, key);
+                if (raw == null || raw.Length < 2 || raw.Length > 4096 || raw[0] != '"') return "";
+                string value = new System.Web.Script.Serialization.JavaScriptSerializer().Deserialize<string>(raw);
+                foreach (char c in value) if (char.IsControl(c)) return "";
+                return value;
+            }
+            catch { return ""; }
         }
 
         private static string ToProjectName(string cwd)
